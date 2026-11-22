@@ -1,8 +1,8 @@
 # PX-CSI iSCSI → NVMe/TCP migration
 
-Moves the volumes of a running OpenShift cluster's Portworx CSI (PX-CSI) from iSCSI to NVMe/TCP on the same Everpure
-FlashArray, one node at a time, with PX-CSI's multi-SAN protocol feature (`StorageCluster.spec.nodes[].env`, PX-CSI 26.3.0 and
-later). It is an Ansible project that talks only to the Kubernetes API and to the array's management API (the
+Moves the volumes of a running Red Hat® OpenShift® cluster's Portworx® CSI (PX-CSI) from iSCSI to NVMe®/TCP on the same
+Everpure FlashArray™ product, one node at a time, with PX-CSI's multi-SAN protocol feature (`StorageCluster.spec.nodes[].env`,
+PX-CSI 26.3.0 and later). It is an Ansible® project that talks only to the Kubernetes® API and to the array's management API (the
 `kubernetes.core` and `everpure.flasharray` collections), changes nothing on a node by hand, and only **reads** the array.
 
 ## Disclaimer
@@ -25,9 +25,16 @@ warranty of any kind (see sections 7 and 8 of the [Apache License 2.0](LICENSE))
 a limitation, it applies to the fullest extent the law permits.
 
 Nothing in this project creates any obligation for Everpure or changes the terms of any agreement, warranty or support
-entitlement you have with Everpure. Everpure, FlashArray, Portworx, PX-CSI, OpenShift, Kubernetes and other names are trademarks
-of their respective owners and are used here only to identify the products the tool works with; their use does not imply any
-affiliation or endorsement.
+entitlement you have with Everpure.
+
+**Trademarks.** Everpure, the Everpure P Logo, Pure Storage, and the marks on the Everpure Trademark List
+([everpuredata.com/trademarks](https://www.everpuredata.com/trademarks)), which include FlashArray™, ActiveCluster™ and
+Portworx®, are trademarks or registered trademarks of Everpure, Inc. in the U.S. and/or other countries. Red Hat®, OpenShift®
+and Ansible® are trademarks of Red Hat, LLC, registered in the United States and other countries. Kubernetes® is a registered
+trademark of The Linux Foundation in the United States and other countries. NVM Express® and NVMe® are registered trademarks
+of NVM Express, Inc. Docker and the Docker logo are trademarks or registered trademarks of Docker, Inc. in the United States
+and/or other countries. Other names may be trademarks of their respective owners. All of them are used here only to identify
+the products this tool works with, and their use does not imply any affiliation with, or endorsement by, their owners.
 
 ## Contents
 - [How it works](#how-it-works)
@@ -88,7 +95,7 @@ minutes of automated work per node in `nodes` plus the time the person needs at 
 **The machine that runs the tool**: Docker, or an Ansible machine with the pinned versions below; it reaches the cluster's API and
 the array's management address; and it has a **terminal** for the `nodes` phase (the breakpoint is an interactive prompt).
 
-**Not covered**: ActiveCluster over NVMe/TCP (PX-CSI does not support it yet), NVMe multi-interface (PX-CSI 26.4.0 and later),
+**Not covered**: the ActiveCluster™ solution over NVMe/TCP (PX-CSI does not support it yet), NVMe multi-interface (PX-CSI 26.4.0 and later),
 NVMe/RDMA and FC, more than one FlashArray per cluster, Portworx Enterprise (non-CSI mode), IPv6.
 
 ## What you give it
