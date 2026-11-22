@@ -5,6 +5,31 @@ FlashArray, one node at a time, with PX-CSI's multi-SAN protocol feature (`Stora
 later). It is an Ansible project that talks only to the Kubernetes API and to the array's management API (the
 `kubernetes.core` and `everpure.flasharray` collections), changes nothing on a node by hand, and only **reads** the array.
 
+## Disclaimer
+**This is an independent, unofficial tool. It is not provided, endorsed, certified or supported by Everpure, Inc. or any of its
+affiliates**, and nothing in this project is an Everpure product, service or deliverable. Any support that Everpure provides for
+its own products does not extend to this tool.
+
+**You use it entirely at your own risk.** It operates on a running production cluster: it drains and reboots nodes, applies
+MachineConfigs and network policies, restarts the PX-CSI node plugins and changes the StorageCluster configuration, and it
+depends on a person changing the network. A defect, a mistake or an unforeseen condition can cause application downtime, loss of
+access to storage, or data loss. You are solely responsible for reviewing the code, testing it outside production, having
+backups and a maintenance window, and for everything that results from running it.
+
+**Everpure, Inc., its affiliates, and their respective officers, directors, employees and agents have no responsibility or
+liability of any kind for this tool or its use, and shall not be held responsible in any manner** for any direct, indirect,
+incidental, special, consequential or exemplary damages or losses (including loss of data, profits or business, or interruption
+of service) arising out of or in connection with the tool, whatever the legal theory and even if advised of the possibility of
+such damage. The same applies to the authors and contributors of this project. The software is provided "AS IS", without
+warranty of any kind (see sections 7 and 8 of the [Apache License 2.0](LICENSE)); where the law does not allow a disclaimer or
+a limitation, it applies to the fullest extent the law permits.
+
+Nothing in this project creates any obligation for Everpure or changes the terms of any agreement, warranty or support
+entitlement you have with Everpure. Everpure, FlashArray, Portworx, PX-CSI, OpenShift, Kubernetes and other names are trademarks
+of their respective owners and are used here only to identify the products the tool works with; their use does not imply any
+affiliation or endorsement.
+
+## Contents
 - [How it works](#how-it-works)
 - [Before you start](#before-you-start)
 - [What you give it](#what-you-give-it)
@@ -249,4 +274,4 @@ tests/model_test.py          offline tests
 For maintainers: [CLAUDE.md](CLAUDE.md) holds the project's rules and the gotchas found during the live runs.
 
 ## License
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE), and the [Disclaimer](#disclaimer) at the top of this page.
