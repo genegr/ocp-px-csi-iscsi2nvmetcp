@@ -1,0 +1,59 @@
+---
+# Demo health, read-only: StatefulSets ready, PVCs Bound, the payload's sha256 intact, the log's sequence consecutive,
+# and which device and node each pod's /data sits on (the protocol evidence: dm-*/mapper = iSCSI + DM multipath,
+# nvme* = native NVMe). Sets demo_evidence for the report.
+- name: Demo PVCs
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ mig_demo_ns }}"
+  register: demo_pvcs
+
+- name: Demo pods
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ mig_demo_ns }}"
+    label_selectors: [app.kubernetes.io/part-of=px-nvme-demo]
+  register: demo_pods
+
+- name: Everything is up
+  ansible.builtin.assert:
+    that:
+      - demo_pods.resources | length == demo_sets | map(attribute='replicas') | map('int') | sum
+      - demo_pods.resources | map('k8s_condition', 'Ready') | unique | list == ['True']
+      - demo_pvcs.resources | length == demo_pods.resources | length
+      - demo_pvcs.resources | map(attribute='status.phase') | unique | list == ['Bound']
+    fail_msg: >-
+      pods {{ demo_pods.resources | map(attribute='metadata.name') | zip(demo_pods.resources | map('k8s_condition', 'Ready')) | list }},
+      PVCs {{ demo_pvcs.resources | map(attribute='metadata.name') | zip(demo_pvcs.resources | map(attribute='status.phase')) | list }}
+    quiet: true
+
+- name: Check script in every pod
+  kubernetes.core.k8s_exec:
+    namespace: "{{ mig_demo_ns }}"
+    pod: "{{ item.metadata.name }}"
+    command: "sh /scripts/{{ (demo_sets | selectattr('name', 'eq', item.metadata.labels.app) | first).checker }}"
+  register: demo_checks
+  changed_when: false
+  loop: "{{ demo_pods.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Evidence per pod
+  ansible.builtin.set_fact:
+    demo_evidence: >-
+      {{ dict(demo_pods.resources | map(attribute='metadata.name') | zip(demo_checks.results | map(attribute='stdout_lines') | map('kv_lines'))) }}
+
+- name: The data is intact and the log is consecutive
+  ansible.builtin.assert:
+    that:
+      - demo_evidence.values() | selectattr('sha', 'defined') | map(attribute='sha') | unique | list in [['ok'], []]
+      - demo_evidence.values() | selectattr('seq', 'defined') | map(attribute='seq') | unique | list in [['ok'], []]
+      - demo_evidence.values() | selectattr('seq', 'defined') | map(attribute='lines') | map('int') | select('lt', 1) | list | length == 0
+    fail_msg: "{{ demo_evidence | to_json }}"
+    quiet: true
+
+- name: Where the demo data sits
+  ansible.builtin.debug:
+    msg: "{{ demo_evidence | dict2items | map(attribute='key') | zip(demo_evidence.values() | map(attribute='node'), demo_evidence.values() | map(attribute='dev')) | map('join', '  ') | list }}"

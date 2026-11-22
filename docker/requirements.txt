@@ -1,0 +1,4 @@
+# Python packages of the toolbox image. Pinned (the versions this project was tested with).
+ansible-core==2.21.4
+kubernetes==36.0.3       # kubernetes.core modules
+py-pure-client==1.94.2   # everpure.flasharray modules

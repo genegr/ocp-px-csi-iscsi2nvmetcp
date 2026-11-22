@@ -1,0 +1,43 @@
+---
+# What the live cluster calls things (read-only). Sets mig_sc (the StorageCluster), mig_stage (baseline | enabled |
+# final | finalizing), mig_sni (api_version, kind, scope of StorageNodeInitiator) and mig_plugin_pods (the node plugin
+# pods, label app.kubernetes.io/component=node-plugin, as the multi-SAN doc selects them).
+- name: StorageCluster
+  kubernetes.core.k8s_info:
+    api_version: core.libopenstorage.org/v1
+    kind: StorageCluster
+    namespace: "{{ mig_ns }}"
+  register: sc_list
+
+- name: Exactly one StorageCluster
+  ansible.builtin.assert:
+    that: sc_list.resources | length == 1
+    fail_msg: "Expected one StorageCluster in {{ mig_ns }}, found {{ sc_list.resources | map(attribute='metadata.name') | list }}"
+    quiet: true
+
+- name: Custom resource definitions
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+  register: crd_list
+
+- name: Node plugin pods
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ mig_ns }}"
+    label_selectors: [app.kubernetes.io/component=node-plugin]
+  register: plugin_list
+
+- name: Live StorageCluster facts
+  ansible.builtin.set_fact:
+    mig_sc: "{{ sc_list.resources[0] }}"
+    mig_stage: "{{ sc_list.resources[0] | mig_stage(mig_label_key) }}"
+    mig_sni: "{{ crd_list.resources | crd_ref('StorageNodeInitiator') }}"
+    mig_plugin_pods: "{{ plugin_list.resources }}"
+
+- name: StorageNodeInitiator is defined
+  ansible.builtin.assert:
+    that: mig_sni | length > 0
+    fail_msg: "No CRD for kind StorageNodeInitiator: PX-CSI >= 26.3.0 (multi-SAN) is required"
+    quiet: true

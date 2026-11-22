@@ -1,0 +1,62 @@
+---
+# A node the MCO has just brought back on the new config (`node`): is it prepared for NVMe/TCP, did it keep its iSCSI
+# identity, and is PX-CSI back on it? If not, the pools are paused (spec.paused, with our annotation) so the MCO reboots no
+# further node, and the run fails with the node as the evidence. Rerunning `--tags prep` unpauses them and goes on.
+- name: "{{ node.name }}: back from the reboot"
+  block:
+    - name: "{{ node.name }}: storage facts"
+      ansible.builtin.include_role:
+        name: nvme_probe
+      vars:
+        probe_nodes: ["{{ node }}"]
+        probe_portals: []
+
+    - name: "{{ node.name }}: PX-CSI node plugin ready again"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_ns }}"
+        label_selectors: [app.kubernetes.io/component=node-plugin]
+        field_selectors: ["spec.nodeName={{ node.hostname }}"]
+      register: vp_plugin
+      until: vp_plugin.resources | length == 1 and vp_plugin.resources[0] | k8s_condition('Ready') == 'True'
+      retries: 30
+      delay: 10
+
+    - name: "{{ node.name }}: prepared for NVMe/TCP, still on iSCSI"
+      ansible.builtin.assert:
+        that:
+          - vp.nvme_tcp_module == 'yes'
+          - vp.modules_load == 'yes'
+          - vp.hostnqn_unit == 'enabled'
+          - vp.hostnqn is match('^nqn[.]')
+          - vp.iqn is match('^iqn[.]')
+          - vp.nvme_multipath == mig_multipath
+          - mig_multipath != 'Y' or (vp.iopolicy_rule == 'yes' and vp.modprobe_conf == 'yes')
+          - mig_multipath != 'N' or vp.nvme_stanza == 'yes'
+        fail_msg: "{{ vp | to_json }}"
+        success_msg: "{{ node.name }} is back: {{ vp.hostnqn }}, nvme_core.multipath={{ vp.nvme_multipath }}, {{ vp.iscsi_sessions }} iSCSI sessions"
+      vars:
+        vp: "{{ probe_facts[node.name] }}"
+
+  rescue:
+    - name: "{{ node.name }}: pause the pools, so the MCO reboots no further node"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: machineconfiguration.openshift.io/v1
+          kind: MachineConfigPool
+          metadata:
+            name: "{{ item }}"
+            annotations: "{{ {'ocp-px-csi-migration/paused': 'prep check failed on ' ~ node.name} }}"
+          spec:
+            paused: true
+        merge_type: merge
+      loop: "{{ mig_mc_pools }}"
+
+    - name: "{{ node.name }}: stop"
+      ansible.builtin.fail:
+        msg: >-
+          {{ node.name }} came back from the MachineConfig reboot but is not prepared: {{ ansible_failed_result.msg | default('?') }}
+          The pools {{ mig_mc_pools }} are paused: the MCO reboots no further node. Find the cause on {{ node.name }}
+          (the probe facts above are the evidence), fix the MachineConfig, then rerun `--tags prep`: it unpauses the pools
+          and carries on.

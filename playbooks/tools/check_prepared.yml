@@ -1,0 +1,30 @@
+---
+# Run the per-node check the `prep` roll uses (verify_prepared_node.yml) on demand: is each node prepared for NVMe/TCP, does
+# it still serve iSCSI, is its PX-CSI node plugin ready. Read-only if every node passes. If a node FAILS, the pools are
+# paused (as in the roll): rerun `migrate.yml --tags prep` to unpause them.
+#   ansible-playbook playbooks/tools/check_prepared.yml -e cluster=<name> [-e 'verify_nodes=["master1"]'] [-e prep_multipath=Y|N]
+- name: Cluster model and migration model
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - nvme_model
+
+- name: Check the nodes
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig }}"
+  tasks:
+    - name: Multipath mode to expect (Y native, N DM multipath)
+      ansible.builtin.set_fact:
+        mig_multipath: "{{ prep_multipath | default(mig_multipath_cfg if mig_multipath_cfg != 'auto' else 'Y') }}"
+
+    - name: Check each node
+      ansible.builtin.include_role:
+        name: nvme_hostprep
+        tasks_from: verify_prepared_node.yml
+      loop: "{{ mig_nodes | selectattr('name', 'in', verify_nodes | default(mig_nodes | map(attribute='name') | list)) | list }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.name }}"

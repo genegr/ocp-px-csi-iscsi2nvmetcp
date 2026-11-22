@@ -1,0 +1,204 @@
+---
+# Deploy the demo workloads (idempotent). On the first deploy it also checks (when the StorageClass names an array pod) that the pod
+# on the array grew by the PVCs' size (purefa_info `pods`, the `volumes` subset breaks on Purity 6.12, #1103).
+- name: Tools image of this release
+  kubernetes.core.k8s_info:
+    api_version: image.openshift.io/v1
+    kind: ImageStreamTag
+    namespace: openshift
+    name: tools:latest
+  register: demo_ist
+
+- name: Existing demo PVCs
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    namespace: "{{ mig_demo_ns }}"
+  register: demo_pvcs_before
+
+- name: First deploy?
+  ansible.builtin.set_fact:
+    demo_first: "{{ demo_pvcs_before.resources | length == 0 }}"
+    demo_pvc_total_gib: "{{ demo_sets | map(attribute='replicas') | map('int') | sum * demo_size_gib | int }}"
+
+- name: Realm pod before the demo
+  everpure.flasharray.purefa_info:
+    gather_subset: [pods]
+  register: demo_fa_before
+  check_mode: false
+  no_log: true
+  when: demo_first and mig_fa_pod_path | length > 0
+
+- name: Demo namespace
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ mig_demo_ns }}"
+        labels:
+          app.kubernetes.io/managed-by: ocp-px-csi-migration
+
+# A dry run (--check) cannot create objects in a namespace that doesn't exist yet: they wait for the real run.
+- name: Is the namespace really there?
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: "{{ mig_demo_ns }}"
+  register: demo_ns
+
+- name: Namespaced objects can be applied
+  ansible.builtin.set_fact:
+    demo_ns_ready: "{{ not ansible_check_mode or demo_ns.resources | length > 0 }}"
+
+- name: Demo scripts
+  when: demo_ns_ready
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: demo-scripts
+        namespace: "{{ mig_demo_ns }}"
+      data:
+        data.sh: |
+          set -e
+          cd /data
+          if [ ! -f payload.bin ]; then
+            dd if=/dev/urandom of=payload.bin bs=1M count=64 status=none
+            sha256sum payload.bin > payload.sha256
+            sync
+          fi
+          echo "$(date -u +%FT%TZ) ${NODE_NAME}" >> starts.log
+          sync
+          exec sleep infinity
+        log.sh: |
+          cd /data
+          [ -f seq ] && i=$(wc -l < seq) || i=0
+          while true; do
+            i=$((i+1))
+            echo "$i $(date -u +%s) ${NODE_NAME}" >> seq
+            sync
+            sleep 5
+          done
+        check-data.sh: |
+          cd /data
+          echo "sha=$(sha256sum -c payload.sha256 >/dev/null 2>&1 && echo ok || echo bad)"
+          echo "starts=$(wc -l < starts.log)"
+          echo "dev=$(grep ' /data ' /proc/mounts | cut -d' ' -f1)"
+          echo "node=${NODE_NAME}"
+        check-log.sh: |
+          cd /data
+          echo "lines=$(wc -l < seq)"
+          echo "seq=$(awk '$1 != NR { bad = 1 } END { print bad ? "bad" : "ok" }' seq)"
+          echo "dev=$(grep ' /data ' /proc/mounts | cut -d' ' -f1)"
+          echo "node=${NODE_NAME}"
+
+- name: Headless Service of the StatefulSets
+  when: demo_ns_ready
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: demo
+        namespace: "{{ mig_demo_ns }}"
+      spec:
+        clusterIP: None
+        selector:
+          app.kubernetes.io/part-of: px-nvme-demo
+        ports:
+          - {name: none, port: 9, protocol: TCP}
+
+- name: StatefulSet {{ item.name }}
+  when: demo_ns_ready
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ mig_demo_ns }}"
+        labels: {app: "{{ item.name }}", app.kubernetes.io/part-of: px-nvme-demo}
+      spec:
+        serviceName: demo
+        replicas: "{{ item.replicas }}"
+        podManagementPolicy: Parallel
+        selector:
+          matchLabels: {app: "{{ item.name }}"}
+        template:
+          metadata:
+            labels: {app: "{{ item.name }}", app.kubernetes.io/part-of: px-nvme-demo}
+          spec:
+            topologySpreadConstraints: >-
+              {{ [{'maxSkew': 1, 'topologyKey': 'kubernetes.io/hostname', 'whenUnsatisfiable': 'ScheduleAnyway',
+                   'labelSelector': {'matchLabels': {'app': item.name}}}] if item.spread else [] }}
+            containers:
+              - name: app
+                image: "{{ demo_ist.resources[0].image.dockerImageReference }}"
+                command: [sh, "/scripts/{{ item.script }}"]
+                env:
+                  - name: NODE_NAME
+                    valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+                readinessProbe:
+                  exec: {command: [test, -s, "/data/{{ item.ready_file }}"]}
+                  periodSeconds: 5
+                volumeMounts:
+                  - {name: data, mountPath: /data}
+                  - {name: scripts, mountPath: /scripts}
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
+                  capabilities: {drop: [ALL]}
+                  seccompProfile: {type: RuntimeDefault}
+            volumes:
+              - {name: scripts, configMap: {name: demo-scripts}}
+        volumeClaimTemplates:
+          - metadata:
+              name: data
+            spec:
+              accessModes: [ReadWriteOnce]
+              storageClassName: "{{ mig_storageclass }}"
+              resources:
+                requests:
+                  storage: "{{ demo_size_gib }}Gi"
+  loop: "{{ demo_sets }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: StatefulSets ready
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: StatefulSet
+    namespace: "{{ mig_demo_ns }}"
+    name: "{{ item.name }}"
+  register: demo_ready
+  until: demo_ready.resources | length == 1 and (demo_ready.resources[0].status.readyReplicas | default(0)) == item.replicas
+  retries: 60
+  delay: 10
+  loop: "{{ demo_sets }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not ansible_check_mode
+
+- name: Realm pod with the demo volumes
+  everpure.flasharray.purefa_info:
+    gather_subset: [pods]
+  register: demo_fa_after
+  check_mode: false
+  no_log: true
+  when: demo_first and not ansible_check_mode and mig_fa_pod_path | length > 0
+
+- name: The demo volumes exist on the array (realm pod provisioned space grew by the PVCs)
+  ansible.builtin.assert:
+    that: grown | int >= demo_pvc_total_gib | int * 1073741824
+    fail_msg: >-
+      {{ mig_fa_pod_path }} provisioned {{ before | human_readable }} before, {{ after | human_readable }} after
+      (expected +{{ demo_pvc_total_gib }} GiB)
+    success_msg: "{{ mig_fa_pod_path }} grew by {{ grown | human_readable }}"
+    quiet: false
+  vars:
+    before: "{{ demo_fa_before.purefa_info.pods[mig_fa_pod_path].total_provisioned | default(0) | int }}"
+    after: "{{ demo_fa_after.purefa_info.pods[mig_fa_pod_path].total_provisioned | default(0) | int }}"
+    grown: "{{ after | int - before | int }}"
+  when: demo_first and not ansible_check_mode and mig_fa_pod_path | length > 0

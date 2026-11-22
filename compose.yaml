@@ -1,0 +1,28 @@
+# Run everything through this service (route A), e.g.:
+#   docker compose run --rm -T toolbox ansible-playbook playbooks/migrate.yml -e cluster=<name> --tags preflight
+# Build once on the Docker host:  docker compose build
+services:
+  toolbox:
+    build:
+      context: docker
+      # Lab DNS servers can sit inside Docker's default bridge 172.17.0.0/16, and bridged containers then cannot resolve
+      # names: build and run on the host network.
+      network: host
+      args:
+        TOOLBOX_UID: "${UID:-1000}"
+        TOOLBOX_GID: "${GID:-1000}"
+    image: px-nvme-migration-toolbox:1
+    network_mode: host
+    user: "${UID:-1000}:${GID:-1000}"
+    working_dir: /work
+    volumes:
+      - ./:/work
+    environment:
+      HOME: /work/.state/home
+      ANSIBLE_CONFIG: /work/ansible.cfg
+      # Forwarded from the invoking shell when set, never given on a command line: the array's API token (a Storage Admin
+      # account's), and the password of an Ansible Vault file (if the token file is one).
+      FA_API_TOKEN:
+      ANSIBLE_VAULT_PASSWORD_FILE:
+    stdin_open: true
+    tty: true

@@ -1,0 +1,25 @@
+---
+# Render the operator's texts for `node` (see defaults/main.yml). The asserts catch an empty or half-rendered template.
+- name: "{{ node.name }}: start"
+  ansible.builtin.debug:
+    msg: "{{ mig_start_prompt.split('\n') }}"
+
+- name: "{{ node.name }}: network change"
+  ansible.builtin.debug:
+    msg: "{{ mig_swap_prompt.split('\n') }}"
+
+- name: "{{ node.name }}: rollback"
+  ansible.builtin.debug:
+    msg: "{{ mig_rollback_prompt.split('\n') }}"
+
+- name: "{{ node.name }}: the texts rendered fully"
+  ansible.builtin.assert:
+    that:
+      - mig_start_prompt is search(node.name)
+      - mig_swap_prompt is search('NIC 1 .MAC ' ~ node.nics[0].mac)
+      - mig_swap_prompt is search('NIC 2 .MAC ')
+      - mig_rollback_prompt is search('NIC 2 .MAC ')
+      # no template marker left over (the markers are built by concatenation: a literal one would be parsed here)
+      - mig_swap_prompt.count('{' ~ '{') == 0 and mig_swap_prompt.count('{' ~ '%') == 0
+      - mig_rollback_prompt.count('{' ~ '{') == 0 and mig_rollback_prompt.count('{' ~ '%') == 0
+    quiet: true

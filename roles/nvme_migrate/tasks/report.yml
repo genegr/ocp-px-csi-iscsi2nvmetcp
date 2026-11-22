@@ -1,0 +1,51 @@
+---
+# Read-only picture of where the migration stands: the StorageCluster stage, and per node its label, StorageNodeInitiator,
+# network addresses (NodeNetworkState) and the probe's storage facts. Run it any time (playbooks/verify.yml).
+- name: Nodes
+  kubernetes.core.k8s_info:
+    kind: Node
+  register: rep_nodes
+
+- name: StorageNodeInitiator per node
+  kubernetes.core.k8s_info:
+    api_version: "{{ mig_sni.api_version }}"
+    kind: "{{ mig_sni.kind }}"
+    namespace: "{{ mig_ns if mig_sni.scope == 'Namespaced' else omit }}"
+    name: "{{ item.hostname }}"
+  register: rep_sni
+  loop: "{{ mig_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: NodeNetworkState per node
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1beta1
+    kind: NodeNetworkState
+    name: "{{ item.hostname }}"
+  register: rep_nns
+  loop: "{{ mig_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Storage state of every node
+  ansible.builtin.include_role:
+    name: nvme_probe
+  vars:
+    probe_nodes: "{{ mig_nodes }}"
+    probe_portals: "{{ mig_portal_ips | default([]) }}"
+
+- name: StorageCluster
+  ansible.builtin.debug:
+    msg: "{{ mig_sc.metadata.name }} stage {{ mig_stage }}; env {{ mig_sc.spec.env | default([]) }}; nodes overrides {{ mig_sc.spec.nodes | default([]) }}"
+
+- name: Node
+  ansible.builtin.debug:
+    msg:
+      - "label {{ ((rep_nodes.resources | selectattr('metadata.name', 'eq', item.hostname) | first).metadata.labels | default({}))[mig_label_key] | default('-') }}; sanTypes {{ (rep_sni.results[idx].resources | first | default({})).spec.sanTypes | default('?') }}; target addresses {{ 'in place' if (rep_nns.results[idx].resources | first | default({})) | nns_has_addresses(item.target_storage) else 'not yet' }}"
+      - "{{ probe_facts[item.name] | default({}) | dict2items | selectattr('key', 'in', ['iscsi_sessions', 'iscsi_luns', 'nvme_ctrls', 'nvme_transports', 'iopolicy', 'nvme_multipath', 'nvme_tcp_module', 'modules_load', 'hostnqn_unit', 'iopolicy_rule', 'modprobe_conf', 'nvme_stanza', 'hostnqn', 'iqn', 'reach']) | items2dict }}"
+      - "array host by IQN: {{ (fa_hosts | default({})) | fa_host_with('iqn', probe_facts[item.name].iqn | default('')) | dict2items | rejectattr('key', 'in', ['performance', 'space']) | items2dict | default({}) }}"
+      - "array host by NQN: {{ (fa_hosts | default({})) | fa_host_with('nqn', probe_facts[item.name].hostnqn | default('')) | dict2items | rejectattr('key', 'in', ['performance', 'space']) | items2dict | default({}) }}"
+  loop: "{{ mig_nodes }}"
+  loop_control:
+    index_var: idx
+    label: "{{ item.name }}"

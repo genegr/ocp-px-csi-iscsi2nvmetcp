@@ -1,0 +1,154 @@
+---
+# Read-only gate for every real phase (and `--tags preflight` alone). Probe Pods and the check namespace are the only
+# objects it creates, and it removes the Pods again. Fails with the finding, never repairs.
+- name: Discover the live objects
+  ansible.builtin.include_tasks: discover.yml
+
+- name: Nodes
+  kubernetes.core.k8s_info:
+    kind: Node
+  register: node_list
+
+- name: Cluster operators
+  kubernetes.core.k8s_info:
+    api_version: config.openshift.io/v1
+    kind: ClusterOperator
+  register: co_list
+
+- name: CSI nodes
+  kubernetes.core.k8s_info:
+    api_version: storage.k8s.io/v1
+    kind: CSINode
+  register: csinode_list
+
+- name: Cluster and PX-CSI are healthy
+  ansible.builtin.assert:
+    that:
+      - node_list.resources | k8s_node_readiness | selectattr('ready') | map(attribute='name') | list | sort
+        == (node_list.resources | map(attribute='metadata.name') | list | sort)
+      - mig_nodes | map(attribute='hostname') | difference(node_list.resources | map(attribute='metadata.name')) | length == 0
+      - co_list.resources | k8s_unhealthy_operators | length == 0
+      - mig_sc.status.phase | default('') in ['Running', 'Online']
+      - mig_nodes | map(attribute='hostname') | difference(csinode_list.resources | k8s_csinodes_with_driver('pxd.portworx.com')) | length == 0
+    fail_msg: >-
+      Not healthy: nodes {{ node_list.resources | k8s_node_readiness }}, unhealthy operators
+      {{ co_list.resources | k8s_unhealthy_operators }}, StorageCluster phase {{ mig_sc.status.phase | default('?') }},
+      CSI nodes with pxd.portworx.com {{ csinode_list.resources | k8s_csinodes_with_driver('pxd.portworx.com') }}
+    quiet: true
+
+- name: Network state of every storage node
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1beta1
+    kind: NodeNetworkState
+    name: "{{ item.hostname }}"
+  register: pf_nns
+  loop: "{{ mig_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# The config says which NIC is which by MAC; the cluster must agree (NMState needs the kubernetes-nmstate operator).
+- name: Every configured storage NIC exists on its node
+  ansible.builtin.assert:
+    that: >-
+      item.0.nics | map(attribute='mac') | difference(item.1.resources[0] | nns_ifaces_by_mac | list) | length == 0
+    fail_msg: >-
+      {{ item.0.name }}: NIC MACs {{ item.0.nics | map(attribute='mac') | list }} in the config, but the node has
+      {{ item.1.resources[0] | nns_ifaces_by_mac }}
+    quiet: true
+  loop: "{{ mig_nodes | zip(pf_nns.results) | list }}"
+  loop_control:
+    label: "{{ item.0.name }}"
+
+# The config's addresses must match what the nodes really have: each NIC is on its current (iSCSI) address, or already on
+# its target one (a node migrated earlier or by an interrupted run).
+- name: Every storage NIC has its current or its target address
+  ansible.builtin.assert:
+    that: >-
+      item.1.resources[0] | nns_has_addresses(item.0.current_storage)
+      or item.1.resources[0] | nns_has_addresses(item.0.target_storage)
+    fail_msg: >-
+      {{ item.0.name }}: the node has neither the configured current addresses {{ item.0.current_storage | map(attribute='address') | list }}
+      nor the target ones {{ item.0.target_storage | map(attribute='address') | list }} on the NICs with MACs
+      {{ item.0.nics | map(attribute='mac') | list }}: check `address`, `target_address` and `mac` in the config.
+    quiet: true
+  loop: "{{ mig_nodes | zip(pf_nns.results) | list }}"
+  loop_control:
+    label: "{{ item.0.name }}"
+
+- name: The PX-CSI in use supports multi-SAN (spec.nodes[].env, >= 26.3.0)
+  ansible.builtin.assert:
+    that:
+      - mig_sc.spec.image | default('') | image_version_ge('26.3.0')
+      - crd_list.resources | selectattr('metadata.name', 'eq', 'storageclusters.core.libopenstorage.org') | list | length == 1
+      - (crd_list.resources | selectattr('metadata.name', 'eq', 'storageclusters.core.libopenstorage.org') | first)
+        | crd_has_path('spec.nodes[].env')
+      - (crd_list.resources | selectattr('metadata.name', 'eq', 'storageclusters.core.libopenstorage.org') | first)
+        | crd_has_path('spec.nodes[].selector.labelSelector')
+    fail_msg: "StorageCluster image {{ mig_sc.spec.image | default('?') }} or its CRD lacks spec.nodes[].env / selector.labelSelector"
+    quiet: true
+
+- name: One node plugin pod per storage node, all running
+  ansible.builtin.assert:
+    that:
+      - mig_plugin_pods | map(attribute='spec.nodeName') | sort == (mig_nodes | map(attribute='hostname') | sort)
+      - mig_plugin_pods | map(attribute='status.phase') | unique == ['Running']
+    fail_msg: >-
+      Node plugin pods (app.kubernetes.io/component=node-plugin) {{ mig_plugin_pods | map(attribute='metadata.name') | list }}
+      on {{ mig_plugin_pods | map(attribute='spec.nodeName') | list }}
+    quiet: true
+
+- name: The driver's log container (its name differs between the docs, so it is read from the pod)
+  ansible.builtin.set_fact:
+    mig_plugin_container: "{{ mig_plugin_pods | first | node_plugin_container }}"
+
+- name: StorageCluster is at a known stage
+  ansible.builtin.assert:
+    that: mig_stage in ['baseline', 'enabled', 'final', 'finalizing']
+    fail_msg: "Cluster env PURE_FLASHARRAY_SAN_TYPE is neither ISCSI nor NVMEOF-TCP: {{ mig_sc.spec.env | default([]) }}"
+    quiet: true
+
+- name: The array's NVMe/TCP portals
+  ansible.builtin.include_role:
+    name: nvme_array
+    tasks_from: info.yml
+
+- name: Portals per target network
+  ansible.builtin.set_fact:
+    mig_portals_all: "{{ fa_network | nvme_portals(mig_cidrs) }}"
+
+- name: Portal sets
+  ansible.builtin.set_fact:
+    mig_portals: "{{ mig_portals_all | rejectattr('cidr', 'eq', '') | list }}"
+    mig_portals_outside: "{{ mig_portals_all | selectattr('cidr', 'eq', '') | list }}"
+
+- name: Every target network has an enabled NVMe/TCP portal on the array
+  ansible.builtin.assert:
+    that: mig_cidrs | reject('in', mig_portals | map(attribute='cidr') | list) | list | length == 0
+    fail_msg: >-
+      Array NVMe/TCP portals {{ mig_portals_all }} do not cover every target network {{ mig_cidrs }}: the migration
+      needs the array's NVMe/TCP interfaces on the networks the nodes will move to.
+    quiet: true
+
+- name: Portal addresses the nodes must reach, and whether PX needs PURE_NVME_ALLOWED_CIDRS during the migration
+  ansible.builtin.set_fact:
+    mig_portal_ips: "{{ mig_portals | map(attribute='address') | list }}"
+    # Without multi-interface PX connects to every NVMe/TCP portal of the array it is told about. Portals outside the
+    # target networks would be unreachable from the nodes: then the per-node override carries the CIDR filter too.
+    mig_node_cidr_env: "{{ mig_portals_outside | length > 0 }}"
+
+- name: Baseline node facts (host NQN, sessions, controllers)
+  ansible.builtin.include_role:
+    name: nvme_probe
+  vars:
+    probe_nodes: "{{ mig_nodes }}"
+    probe_portals: []
+
+- name: Preflight summary
+  ansible.builtin.debug:
+    msg:
+      - "stage: {{ mig_stage }}; StorageCluster {{ mig_sc.metadata.name }} image {{ mig_sc.spec.image }}"
+      - "node plugin pods {{ mig_plugin_pods | map(attribute='metadata.name') | list }}, log container {{ mig_plugin_container }}"
+      - "StorageNodeInitiator: {{ mig_sni }}"
+      - "array NVMe/TCP portals in the target networks: {{ mig_portal_ips }}; outside: {{ mig_portals_outside | map(attribute='address') | list }}"
+      - "PURE_NVME_ALLOWED_CIDRS needed during the migration: {{ mig_node_cidr_env }}"
+      - "probe: {{ probe_facts | default({}) }}"

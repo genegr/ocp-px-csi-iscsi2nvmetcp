@@ -1,0 +1,218 @@
+---
+# Attach check on one node (`node`, `verify_protocol` nvme | iscsi). `mig_attach_pods` (default 2) test Pods, each with
+# its own fresh 1 GiB PVC, are pinned to the node (nodeName, so the scheduler is not in the way). Each Pod writes a payload
+# with its sha256 and is Ready only once that is on the volume. Then the evidence from four sides, every one asserted:
+#   the Pods:   the device behind /data and the payload's checksum read back through the mount
+#   the node:   NVMe controllers (transport, portals inside the target networks) or iSCSI sessions and LUNs, the I/O
+#               policy, the by-id links (probe Pod)
+#   the array:  the node's host object (found by the node's NQN or IQN, never by name) has a connection to EVERY test volume
+#               (each Pod's PV matched to the array volume that carries it)
+# The evidence is kept in `mig_evidence[node]` for evidence.yml, the report at the end of the phase. Pods and PVCs are
+# removed afterwards, also when a check fails.
+- name: "{{ node.name }}: attach check ({{ verify_protocol }})"
+  block:
+    - name: Check namespace and tools image
+      ansible.builtin.include_role:
+        name: nvme_probe
+        tasks_from: namespace.yml
+
+    - name: "{{ node.name }}: names of the test Pods and PVCs"
+      ansible.builtin.set_fact:
+        ac_names: "{{ range(1, mig_attach_pods | int + 1) | map('string') | map('regex_replace', '^', 'attach-check-' ~ node.name ~ '-') | list }}"
+
+    - name: "{{ node.name }}: PVCs"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ item }}"
+            namespace: "{{ mig_check_ns }}"
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: "{{ mig_storageclass }}"
+            resources:
+              requests:
+                storage: 1Gi
+      loop: "{{ ac_names }}"
+
+    - name: "{{ node.name }}: PVCs bound"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ mig_check_ns }}"
+        name: "{{ item }}"
+      register: ac_pvc
+      until: (ac_pvc.resources[0].status.phase | default('')) == 'Bound'
+      retries: 30
+      delay: 10
+      loop: "{{ ac_names }}"
+
+    # Ready (the readiness probe) means the payload and its checksum are on the volume.
+    - name: "{{ node.name }}: Pods on the node write their volume and stay up"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ item }}"
+            namespace: "{{ mig_check_ns }}"
+          spec:
+            nodeName: "{{ node.hostname }}"
+            restartPolicy: Never
+            terminationGracePeriodSeconds: 1
+            containers:
+              - name: rw
+                image: "{{ mig_tools_image }}"
+                command:
+                  - sh
+                  - -c
+                  - dd if=/dev/urandom of=/data/payload bs=1M count=8 2>/dev/null && (cd /data && sha256sum payload > payload.sha256) && sync && sleep 3600
+                readinessProbe:
+                  exec: {command: [test, -s, /data/payload.sha256]}
+                  periodSeconds: 2
+                volumeMounts: [{name: data, mountPath: /data}]
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
+                  capabilities: {drop: [ALL]}
+                  seccompProfile: {type: RuntimeDefault}
+            volumes:
+              - {name: data, persistentVolumeClaim: {claimName: "{{ item }}"}}
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 600
+      loop: "{{ ac_names }}"
+
+    - name: "{{ node.name }}: the device behind /data of each Pod"
+      kubernetes.core.k8s_exec:
+        namespace: "{{ mig_check_ns }}"
+        pod: "{{ item }}"
+        command: grep " /data " /proc/mounts
+      register: ac_mounts
+      changed_when: false
+      loop: "{{ ac_names }}"
+
+    - name: "{{ node.name }}: the payload's checksum read back through the mount"
+      kubernetes.core.k8s_exec:
+        namespace: "{{ mig_check_ns }}"
+        pod: "{{ item }}"
+        command: 'sh -c "cd /data && sha256sum -c payload.sha256"'
+      register: ac_sums
+      changed_when: false
+      loop: "{{ ac_names }}"
+
+    - name: "{{ node.name }}: the node's storage state with the volumes attached"
+      ansible.builtin.include_role:
+        name: nvme_probe
+      vars:
+        probe_nodes: ["{{ node }}"]
+
+    - name: "{{ node.name }}: what the Pods and the node say"
+      ansible.builtin.set_fact:
+        ac_pvs: "{{ ac_pvc.results | map(attribute='resources') | map('first') | map(attribute='spec.volumeName') | list }}"
+        ac_devs: "{{ ac_mounts.results | map(attribute='stdout') | map('split') | map('first') | list }}"
+        ac_data: "{{ ac_sums.results | map(attribute='stdout') | map('trim') | list }}"
+        ac_facts: "{{ probe_facts[node.name] }}"
+
+    # PX creates the node's host object at the first attach: wait until it exists AND holds every test volume.
+    - name: "{{ node.name }}: the node's host object on the array, with every test volume"
+      everpure.flasharray.purefa_info:
+        gather_subset: [hosts]
+      register: ac_fa
+      check_mode: false
+      no_log: true
+      until: >-
+        (ac_fa.purefa_info.hosts | fa_host_with(want_key, probe_facts[node.name][want_fact])) | length > 0
+        and ((ac_fa.purefa_info.hosts | fa_host_with(want_key, probe_facts[node.name][want_fact])) | fa_host_volumes_for(ac_pvs)) | length == ac_pvs | length
+      retries: 12
+      delay: 10
+      vars:
+        want_key: "{{ 'nqn' if verify_protocol == 'nvme' else 'iqn' }}"
+        want_fact: "{{ 'hostnqn' if verify_protocol == 'nvme' else 'iqn' }}"
+
+    - name: "{{ node.name }}: the array host"
+      ansible.builtin.set_fact:
+        ac_host: "{{ ac_fa.purefa_info.hosts | fa_host_with('nqn' if verify_protocol == 'nvme' else 'iqn', probe_facts[node.name]['hostnqn' if verify_protocol == 'nvme' else 'iqn']) }}"
+
+    - name: "{{ node.name }}: the test Pods used the node's storage and every checksum matched"
+      ansible.builtin.assert:
+        that:
+          - ac_data | select('search', 'OK$') | list | length == ac_names | length
+          - ac_host | fa_host_volumes_for(ac_pvs) | length == ac_pvs | length
+        fail_msg: "{{ node.name }}: checksums {{ ac_data }}; test volumes {{ ac_pvs }} on array host {{ ac_host.name | default('none') }}: {{ ac_host | fa_host_volumes_for(ac_pvs) }}"
+        quiet: true
+
+    - name: "{{ node.name }}: NVMe/TCP is what the volumes use"
+      ansible.builtin.assert:
+        that:
+          - ac_facts.nvme_transports == 'tcp,'
+          - ac_facts.nvme_ctrls | int >= 1
+          - ac_facts.nvme_addresses | probe_traddrs | addrs_in_cidrs(mig_cidrs)
+          - ac_facts.nvme_multipath == 'N' or ac_devs | reject('search', 'nvme') | list | length == 0
+          - ac_facts.nvme_multipath == 'N' or ac_facts.iopolicy == 'queue-depth,'
+          - ac_facts.nvme_multipath == 'N' or ac_facts.nvme_byid | int >= ac_names | length
+        fail_msg: "{{ node.name }}: /data on {{ ac_devs }}; {{ ac_facts | to_json }}"
+        quiet: true
+      when: verify_protocol == 'nvme'
+
+    - name: "{{ node.name }}: iSCSI is what the volumes use"
+      ansible.builtin.assert:
+        that:
+          - ac_facts.iscsi_sessions | int >= 1
+          - ac_facts.iscsi_luns | int >= ac_names | length
+          - ac_devs | reject('match', '/dev/(mapper/|dm-|sd)') | list | length == 0
+        fail_msg: "{{ node.name }}: /data on {{ ac_devs }}; {{ ac_facts | to_json }}"
+        quiet: true
+      when: verify_protocol == 'iscsi'
+
+    # Only a passed check is recorded; a failed one stops the run at the assert above with its own message.
+    - name: "{{ node.name }}: keep the evidence for the report"
+      ansible.builtin.set_fact:
+        mig_evidence: "{{ mig_evidence | default({}) | combine({node.name: ac_record}) }}"
+      vars:
+        ac_record:
+          protocol: "{{ verify_protocol }}"
+          at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+          pods: "{{ ac_names }}"
+          pvs: "{{ ac_pvs }}"
+          devices: "{{ ac_devs }}"
+          data: "{{ ac_data }}"
+          transport: "{{ ac_facts.nvme_transports | trim(',') }}"
+          controllers: "{{ ac_facts.nvme_ctrls | int }}"
+          expected_controllers: "{{ mig_portal_ips | default([]) | length }}"
+          traddrs: "{{ ac_facts.nvme_addresses | probe_traddrs | sort }}"
+          multipath: "{{ ac_facts.nvme_multipath }}"
+          iopolicy: "{{ ac_facts.iopolicy | trim(',') }}"
+          by_id: "{{ ac_facts.nvme_byid | int }}"
+          sessions: "{{ ac_facts.iscsi_sessions | int }}"
+          luns: "{{ ac_facts.iscsi_luns | int }}"
+          array_host: "{{ ac_host.name }}"
+          array_id: "{{ (ac_host.nqn if verify_protocol == 'nvme' else ac_host.iqn) | default([]) }}"
+          array_matched: "{{ ac_host | fa_host_volumes_for(ac_pvs) }}"
+          array_connections: "{{ ac_host | fa_host_connections }}"
+
+  always:
+    - name: "{{ node.name }}: remove the test Pods"
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_check_ns }}"
+        name: "attach-check-{{ node.name }}-{{ item }}"
+        state: absent
+        wait: true
+      changed_when: false
+      loop: "{{ range(1, mig_attach_pods | int + 1) | list }}"
+
+    - name: "{{ node.name }}: remove the test PVCs"
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ mig_check_ns }}"
+        name: "attach-check-{{ node.name }}-{{ item }}"
+        state: absent
+        wait: true
+      changed_when: false
+      loop: "{{ range(1, mig_attach_pods | int + 1) | list }}"

@@ -1,0 +1,67 @@
+# Migration config of one cluster: clusters/<name>.yaml (gitignored); pass the name as -e cluster=<name>. This file is
+# the whole input: the project reads nothing else about your cluster, and needs no other project. Examples use RFC 5737
+# addresses and example.com.
+#
+# The migration changes the NETWORK behind each node's storage NICs (on bare metal: the VLAN of the switch ports), never
+# the NICs. A NIC is identified by its MAC; it has one address on its iSCSI network now and one on its NVMe/TCP network
+# after. Nothing here names a platform.
+
+cluster:
+  name: lab
+  kubeconfig: .state/kubeconfig      # a kubeconfig with cluster-admin rights; relative = to this project's directory
+                                     # (with Docker keep it inside the project, e.g. under .state/, or add a -v)
+
+flasharray:
+  endpoint: 192.0.2.40               # the array's management address, written as the px-pure-secret writes it: the run stops if
+                                     # that secret (in the Portworx namespace) does not list it
+  # An array account with the Storage Admin role (PX-CSI's own token may be scoped to its realm and cannot list the array's
+  # network interfaces). Its API token is never in this file: the environment variable below (forwarded into the container,
+  # never on a command line), else the file below (mode 0600; it may be an Ansible Vault file).
+  token_env: FA_API_TOKEN
+  token_file: .state/fa-token
+  # No realm and no pod here: the realm is read from the px-pure-secret and the pod from the StorageClass below.
+
+portworx:
+  namespace: portworx                # where PX-CSI runs: the StorageCluster, its node plugins and the px-pure-secret
+  storageclass: px-fa                # the PX-CSI StorageClass the demo and the attach checks use (and the array pod it names)
+
+machineconfig_pools: [master]        # the MachineConfigPools of the storage nodes: [master] on a compact cluster, else [worker]
+
+nmstate:
+  # The NodeNetworkConfigurationPolicy that gives each node's storage NICs their addresses ({node} = the node's name). If it
+  # exists the migration updates it in place; if not, it is created. Needs the kubernetes-nmstate operator.
+  policy: storage-{node}
+
+networks:
+  current:                           # the networks the storage NICs are on today (iSCSI); NIC n <-> entry n
+    - {name: iscsi-a, cidr: 198.18.30.0/24, mtu: 1500}
+    - {name: iscsi-b, cidr: 198.18.31.0/24}
+  target:                            # where they go (NVMe/TCP); the array already has portals there
+    - {name: nvme-a, cidr: 198.51.100.0/24, mtu: 1500}
+    - {name: nvme-b, cidr: 203.0.113.0/24}
+
+nodes:                               # every node that runs the PX-CSI node plugin
+  - name: node0
+    hostname: node0.example.com      # the Kubernetes node name (default: name)
+    nics:                            # one per network, in order
+      - {mac: "02:00:00:00:30:01", address: 198.18.30.101, target_address: 198.51.100.101}
+      - {mac: "02:00:00:00:31:01", address: 198.18.31.101, target_address: 203.0.113.101}
+  - name: node1
+    hostname: node1.example.com
+    nics:
+      - {mac: "02:00:00:00:30:02", address: 198.18.30.102, target_address: 198.51.100.102}
+      - {mac: "02:00:00:00:31:02", address: 198.18.31.102, target_address: 203.0.113.102}
+
+migration:
+  label: storage-protocol=nvme-tcp   # node label that selects spec.nodes[] (the multi-SAN doc's example)
+  multipath: auto                    # auto | Y | N : auto reads nvme_core.multipath=N from the nodes' cmdline
+  demo:
+    namespace: px-nvme-demo          # demo StatefulSets and their PVCs
+  # Free text printed at the breakpoint, for what only this site knows: which switch ports, VLAN ids, who to ask. The
+  # breakpoint itself always prints the node, its NIC MACs, the old and new network (name, CIDR) and the new address.
+  operator_note: |
+    Change the VLAN of the node's two storage switch ports: NIC 1 from VLAN 30 to VLAN 130, NIC 2 from VLAN 31 to 131.
+  # REQUIRED (the model refuses to load without it): the physical network the NICs are on today and who puts it back. Nothing
+  # else records it, and a rollback needs it. Write it before the first node moves.
+  operator_note_rollback: |
+    Change the VLAN of the node's two storage switch ports back: NIC 1 to VLAN 30, NIC 2 to VLAN 31.

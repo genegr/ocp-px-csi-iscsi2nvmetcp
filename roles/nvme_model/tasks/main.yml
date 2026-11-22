@@ -1,0 +1,154 @@
+---
+# The migration model, from this project's own config clusters/<cluster>.yaml (nothing else is read): the cluster to reach,
+# the array, the storage nodes with their NICs' MACs and addresses before and after, the networks, the label. The model
+# is built and validated by the mig_model filter (plugins/filter/nvme_migration.py).
+- name: Project root
+  ansible.builtin.set_fact:
+    mig_root: "{{ role_path | dirname | dirname }}"
+
+- name: The cluster is named
+  ansible.builtin.assert:
+    that: cluster is defined
+    fail_msg: "Pass -e cluster=<name>: the migration config is clusters/<name>.yaml"
+    quiet: true
+
+- name: Look for the migration config
+  ansible.builtin.stat:
+    path: "{{ mig_root }}/clusters/{{ cluster }}.yaml"
+  register: mig_cfg_stat
+
+- name: The migration config exists
+  ansible.builtin.assert:
+    that: mig_cfg_stat.stat.exists
+    fail_msg: "No {{ mig_root }}/clusters/{{ cluster }}.yaml: start from cluster.example.yaml"
+    quiet: true
+
+- name: Read the migration config
+  ansible.builtin.include_vars:
+    file: "{{ mig_root }}/clusters/{{ cluster }}.yaml"
+    name: mig_raw
+
+- name: The model (validated)
+  ansible.builtin.set_fact:
+    mig: "{{ mig_raw | mig_model }}"
+
+- name: The config is named after its cluster
+  ansible.builtin.assert:
+    that: mig.cluster.name == cluster
+    fail_msg: "clusters/{{ cluster }}.yaml says cluster.name {{ mig.cluster.name }}"
+    quiet: true
+
+- name: Migration facts
+  ansible.builtin.set_fact:
+    mig_cluster: "{{ mig.cluster.name }}"
+    mig_label_key: "{{ mig.label.key }}"
+    mig_label_value: "{{ mig.label.value }}"
+    mig_multipath_cfg: "{{ mig.multipath }}"
+    mig_nodes: "{{ mig.nodes }}"
+    mig_cidrs: "{{ mig.cidrs }}"
+    mig_mc_pools: "{{ mig.mc_pools }}"
+    mig_nncp_pattern: "{{ mig.nmstate_policy }}"
+    mig_ns: "{{ mig.portworx.namespace }}"
+    mig_storageclass: "{{ mig.portworx.storageclass }}"
+    mig_demo_ns: "{{ mig.demo_namespace }}"
+    mig_check_ns: ocp-px-migration-checks
+    mig_state_dir: "{{ mig_root }}/.state/{{ cluster }}"
+    mig_to_san: NVMEOF-TCP
+    # Site-specific words for the operator at the breakpoint (which ports, which VLAN ids); optional.
+    mig_note: "{{ mig.operator_note }}"
+    mig_note_rollback: "{{ mig.operator_note_rollback }}"
+    # A relative path is relative to the project directory; an absolute one stays.
+    kubeconfig: "{{ [mig_root, mig.cluster.kubeconfig | expanduser] | path_join }}"
+
+- name: Look for the kubeconfig
+  ansible.builtin.stat:
+    path: "{{ kubeconfig }}"
+  register: mig_kubeconfig_stat
+
+- name: The kubeconfig exists
+  ansible.builtin.assert:
+    that: mig_kubeconfig_stat.stat.exists
+    fail_msg: >-
+      No kubeconfig at {{ kubeconfig }}: set cluster.kubeconfig in clusters/{{ cluster }}.yaml to a kubeconfig with
+      cluster-admin rights (a relative path is relative to the project directory; with Docker keep it inside it, e.g. .state/).
+    quiet: true
+
+# The array. Its management address and the API token of an array account (a Storage Admin) are this config's:
+# flasharray.endpoint, and the token from flasharray.token_env or flasharray.token_file, never in the YAML itself and never
+# on a command line (the environment variable is forwarded into the container; the file is mode 0600 and may be an Ansible
+# Vault file, which the file lookup decrypts). PX-CSI's own token is not used: it may be scoped to its realm and unable to
+# list the array's network interfaces. What PX-CSI holds in the cluster is not copied but checked and read: the
+# px-pure-secret in the Portworx namespace must list the config's array (else the config would be about another array than
+# the one PX uses) and gives its realm; the pod comes from the StorageClass.
+- name: Look for the token file
+  ansible.builtin.stat:
+    path: "{{ [mig_root, mig.flasharray.token_file | expanduser] | path_join }}"
+  register: mig_fa_token_file
+
+- name: The array token
+  ansible.builtin.set_fact:
+    mig_fa_token: >-
+      {{ lookup('ansible.builtin.env', mig.flasharray.token_env)
+         or (lookup('ansible.builtin.file', [mig_root, mig.flasharray.token_file | expanduser] | path_join) | trim
+             if mig_fa_token_file.stat.exists else '') }}
+  no_log: true
+
+- name: The array token is there
+  ansible.builtin.assert:
+    that: mig_fa_token | length > 0
+    fail_msg: >-
+      No FlashArray API token: export {{ mig.flasharray.token_env }} (passed through to the container) or put the token in
+      {{ mig.flasharray.token_file }} (mode 0600, may be an Ansible Vault file). It is the token of an array account with the
+      Storage Admin role.
+    quiet: true
+  no_log: true
+
+- name: The Portworx secret (read for the array's realm and to check the array; its token is not used)
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ mig_ns }}"
+    name: px-pure-secret
+  register: mig_fa_secret
+  no_log: true
+
+- name: The config's array in it
+  ansible.builtin.set_fact:
+    mig_fa: "{{ mig_fa_secret.resources | first | default(none) | fa_from_secret(mig.flasharray.endpoint) }}"
+
+- name: The secret lists the config's array
+  ansible.builtin.assert:
+    that: mig_fa.error | length == 0
+    fail_msg: "Secret px-pure-secret in namespace {{ mig_ns }} (portworx.namespace in clusters/{{ cluster }}.yaml): {{ mig_fa.error }}"
+    quiet: true
+
+- name: The StorageClass
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    name: "{{ mig_storageclass }}"
+  register: mig_fa_sc
+
+- name: The array
+  ansible.builtin.set_fact:
+    mig_fa_endpoint: "{{ mig.flasharray.endpoint }}"
+    mig_fa_realm: "{{ mig_fa.realm }}"
+    # empty when the StorageClass names no pod: the demo then skips its check of the pod's provisioned space
+    mig_fa_pod_path: "{{ mig_fa_sc.resources | first | default(none) | fa_pod_path(mig_fa.realm) }}"
+
+- name: The array this migration reads (the realm and the pod come from the cluster, not from this config)
+  ansible.builtin.debug:
+    msg: >-
+      FlashArray {{ mig_fa_endpoint }}, realm {{ mig_fa_realm | default('', true) or '(none)' }}, pod
+      {{ mig_fa_pod_path or '(StorageClass ' ~ mig_storageclass ~ ' names none)' }}
+  changed_when: false
+
+- name: Migration table, storage NICs per node (network and address now, then after)
+  ansible.builtin.debug:
+    msg: >-
+      {% for n in mig_nodes %}{{ n.name }}:{% for nic in n.nics %}
+      [{{ nic.old.name }} {{ nic.old.address }} -> {{ nic.new.name }} {{ nic.new.address }}]{% endfor %}
+      {% endfor %}
+  changed_when: false

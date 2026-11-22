@@ -1,0 +1,25 @@
+---
+# One attempt of probe_wait.yml. The whole attempt is a block with its own `when`: an include_tasks loop is expanded up
+# front, and a `when` on the include only governs the include, so without this every attempt would run, success or not.
+- name: Probe once, unless an earlier attempt already saw the condition hold
+  when: not probe_ok | bool
+  block:
+    - name: Probe the node
+      ansible.builtin.include_role:
+        name: nvme_probe
+      vars:
+        probe_nodes: ["{{ node }}"]
+
+    # Two tasks on purpose: all values of one set_fact are templated before any of them is set, and probe_cond reads nd_facts.
+    - name: The node's facts
+      ansible.builtin.set_fact:
+        nd_facts: "{{ probe_facts[node.name] }}"
+
+    - name: Does the condition hold?
+      ansible.builtin.set_fact:
+        probe_ok: "{{ probe_cond | bool }}"
+
+    - name: Wait before the next attempt
+      ansible.builtin.pause:
+        seconds: "{{ probe_delay | default(15) | int }}"
+      when: not probe_ok and probe_attempt | int < (probe_tries | default(8)) | int - 1

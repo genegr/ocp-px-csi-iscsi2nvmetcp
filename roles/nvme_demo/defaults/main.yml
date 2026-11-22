@@ -1,0 +1,10 @@
+---
+demo_size_gib: 1
+# The two demo StatefulSets (one PVC of demo_size_gib per replica, StorageClass of the cluster's PX-CSI).
+#   demo-data  3 replicas spread over the nodes: a 64 MiB random payload written once, its sha256, and a line per start
+#              (which node it started on): proves the data survives evictions and the change of protocol.
+#   demo-log   2 replicas appending "seq epoch node" every 5 s with sync: proves writes continue without gaps or
+#              duplicates across pod moves.
+demo_sets:
+  - {name: demo-data, replicas: 3, script: data.sh, checker: check-data.sh, ready_file: payload.sha256, spread: true}
+  - {name: demo-log, replicas: 2, script: log.sh, checker: check-log.sh, ready_file: seq, spread: false}

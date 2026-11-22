@@ -1,0 +1,14 @@
+---
+# Probe `node` until `probe_cond` (a Jinja expression over nd_facts, passed as a var and so evaluated after each probe)
+# holds: up to probe_tries attempts, probe_delay seconds apart. `probe_portals` goes to the probe. Leaves probe_ok and
+# nd_facts (the node's last probe); the caller asserts probe_ok and says what failed.
+- name: Not done yet
+  ansible.builtin.set_fact:
+    probe_ok: false
+
+- name: "{{ node.name }}: probing until {{ probe_what | default('the condition holds') }}"
+  ansible.builtin.include_tasks: probe_wait_attempt.yml
+  loop: "{{ range(probe_tries | default(8)) | list }}"
+  loop_control:
+    loop_var: probe_attempt
+    label: "attempt {{ probe_attempt + 1 }}"

@@ -1,0 +1,54 @@
+---
+# How many test Pods (each with its own fresh PVC) the attach check pins to a node after it is migrated (or rolled back).
+mig_attach_pods: 2
+
+# How long the drain waits for the evicted Pods to be gone, in seconds (k8s_drain wait_timeout). It is short on purpose: with
+# force the module also deletes finished Pods, and on a control plane the operators recreate their revision-pruner Pods under
+# the same name, which the module counts as "still running" until this runs out (measured: a full 900 s on a control-plane node). The wait is only
+# a courtesy: running out is a warning, and the volume gate that follows (no VolumeAttachment, no volume on the array host, no
+# LUN) is the real wait. Raise it for workloads with a long termination grace period: -e mig_drain_wait=900.
+mig_drain_wait: 120
+
+# What the operator reads at each pause. They live here, not inline in the tasks, so playbooks/tools/show_breakpoint.yml can
+# render exactly the same text for a node before anything is drained (a template error after a drain would leave the node
+# cordoned). All three need `node` (a mig_nodes entry) and the facts of nvme_model.
+mig_start_prompt: |
+
+  ==== {{ node.name }} ({{ node.hostname }}): about to migrate ====
+  This cordons and drains the node, then waits for you to change the network behind its storage NICs.
+  Nothing has been changed yet. Press Enter to start (Ctrl-C then A aborts)
+
+mig_swap_prompt: |
+
+  ==== OPERATOR ACTION on {{ node.name }} ({{ node.hostname }}): cordoned and drained ====
+  Change the network behind the node's storage NICs, from the iSCSI networks to the NVMe/TCP networks (on bare metal:
+  a VLAN change on the node's switch ports). Change only that. Do NOT change any address on the node: the playbook
+  sets the addresses below (NMState) as soon as you press Enter. The NICs keep their MACs:
+  {% for nic in node.nics %}
+    NIC {{ loop.index }} (MAC {{ nic.mac }}): {{ nic.old.name }} {{ nic.old.cidr }} -> {{ nic.new.name }} {{ nic.new.cidr }}
+      address after: {{ nic.new.address }}/{{ nic.new.prefix }} (set by the playbook)
+  {% endfor %}
+  {% if mig_note | length > 0 %}
+  Site note (operator_note of the config):
+  {{ mig_note | indent(2) }}
+  {% endif %}
+  Before you press Enter: the addresses above must be free on the new networks. Afterwards the playbook applies them and
+  checks that every array NVMe/TCP portal ({{ mig_portal_ips | default([]) | join(', ') }}) answers on 4420;
+  if one does not, it stops and nothing else changes.
+  Press Enter when the network change is done (Ctrl-C then A aborts; nothing else changes until you do)
+
+mig_rollback_prompt: |
+
+  ==== OPERATOR ACTION on {{ node.name }} ({{ node.hostname }}): ROLLBACK, cordoned and drained ====
+  Change the network behind the node's storage NICs back, to the iSCSI networks (on bare metal: a VLAN change on the
+  node's switch ports). Change only that. Do NOT change any address on the node: the playbook restores the addresses
+  below (NMState) as soon as you press Enter:
+  {% for nic in node.nics %}
+    NIC {{ loop.index }} (MAC {{ nic.mac }}): {{ nic.new.name }} {{ nic.new.cidr }} -> {{ nic.old.name }} {{ nic.old.cidr }}
+      address after: {{ nic.old.address }}/{{ nic.old.prefix }} (set by the playbook)
+  {% endfor %}
+  {% if mig_note_rollback | length > 0 %}
+  Site note (operator_note_rollback of the config):
+  {{ mig_note_rollback | indent(2) }}
+  {% endif %}
+  Press Enter when the network change is done (Ctrl-C then A aborts)

@@ -1,0 +1,40 @@
+---
+# Print, for every storage node, the three texts the operator reads during the `nodes` phase (start, network change,
+# rollback), rendered from the same templates the phase uses. Read-only; needs the array only for the portal list.
+# Run it before a real `nodes` run: a template error found here costs nothing, found at the pause it would leave a node drained.
+#   ansible-playbook playbooks/tools/show_breakpoint.yml -e cluster=<name>
+- name: Cluster model and migration model
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - nvme_model
+
+- name: The operator's texts
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig }}"
+    group/everpure.flasharray.everpure.flasharray:
+      fa_url: "{{ mig_fa_endpoint }}"
+      api_token: "{{ mig_fa_token }}"
+  tasks:
+    - name: The array's NVMe/TCP interfaces
+      ansible.builtin.include_role:
+        name: nvme_array
+        tasks_from: info.yml
+      vars:
+        array_subsets: [network]
+
+    - name: Portals the nodes will be asked to reach
+      ansible.builtin.set_fact:
+        mig_portal_ips: "{{ fa_network | nvme_portals(mig_cidrs) | rejectattr('cidr', 'eq', '') | map(attribute='address') | list }}"
+
+    - name: What the operator reads
+      ansible.builtin.include_role:
+        name: nvme_migrate
+        tasks_from: show_breakpoint.yml
+      loop: "{{ mig_nodes | selectattr('name', 'in', verify_nodes | default(mig_nodes | map(attribute='name') | list)) | list }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.name }}"

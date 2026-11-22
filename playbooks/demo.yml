@@ -1,0 +1,58 @@
+---
+# Demo stateful workloads (two StatefulSets with PVCs on the cluster's PX-CSI StorageClass) and their verification.
+#   deploy    create them (idempotent); the first deploy also checks the realm pod on the array grew
+#   verify    pods ready, PVCs Bound, payload sha256 intact, log sequence consecutive, device and node per pod
+#   bounce    delete the pods so every volume is detached and attached again (after the migration: over NVMe/TCP);
+#             `--tags bounce,verify` bounces first and verifies the data afterwards
+#   teardown  delete the namespace and the volumes; needs -e confirm=<demo namespace>
+# No tag = deploy + verify.
+- name: Cluster model and migration model
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - nvme_model
+  tags: always
+
+- name: Demo workloads
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig }}"
+    group/everpure.flasharray.everpure.flasharray:
+      fa_url: "{{ mig_fa_endpoint }}"
+      api_token: "{{ mig_fa_token }}"
+  tasks:
+    - name: Deploy the demo
+      ansible.builtin.include_role:
+        name: nvme_demo
+        apply:
+          tags: [deploy]
+      tags: [deploy]
+
+    # Bounce comes before verify on purpose: `--tags bounce,verify` is the proof after a migration (re-attach every volume,
+    # then check the data), and tasks run in file order whatever the order of the tags.
+    - name: Bounce the demo pods
+      ansible.builtin.include_role:
+        name: nvme_demo
+        tasks_from: bounce.yml
+        apply:
+          tags: [bounce]
+      tags: [bounce, never]
+
+    - name: Verify the demo
+      ansible.builtin.include_role:
+        name: nvme_demo
+        tasks_from: verify.yml
+        apply:
+          tags: [verify]
+      tags: [verify]
+      when: not ansible_check_mode
+
+    - name: Remove the demo
+      ansible.builtin.include_role:
+        name: nvme_demo
+        tasks_from: teardown.yml
+        apply:
+          tags: [teardown]
+      tags: [teardown, never]

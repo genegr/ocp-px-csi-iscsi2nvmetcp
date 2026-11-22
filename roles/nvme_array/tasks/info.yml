@@ -1,0 +1,27 @@
+---
+# Read-only view of the FlashArray (everpure.flasharray, module_defaults group of the play carries fa_url/api_token).
+# Never the `volumes` subset: it fails on Purity//FA 6.12 (Everpure-Ansible/FlashArray-Collection#1103).
+# Sets fa_network (interfaces: address, services) and fa_hosts (hosts: iqn, nqn, volumes) for the subsets asked in
+# `array_subsets` (default both). check_mode: false because reading is all it does, also under --check.
+- name: FlashArray {{ array_subsets | default(['network', 'hosts']) | join(', ') }}
+  everpure.flasharray.purefa_info:
+    gather_subset: "{{ array_subsets | default(['network', 'hosts']) }}"
+  register: fa_info
+  check_mode: false
+  ignore_errors: true
+  no_log: true
+
+# The failure text is shown with the token masked out of it (no_log hides the task's own output).
+- name: The array answered
+  ansible.builtin.assert:
+    that: fa_info is not failed
+    fail_msg: >-
+      The FlashArray {{ mig_fa_endpoint }} refused to read {{ array_subsets | default(['network', 'hosts']) | join(', ') }}:
+      {{ fa_info.msg | default('') | replace(mig_fa_token, '***') | truncate(300) }}. The token must be that of an array-level
+      account (Storage Admin), not one scoped to a realm, which cannot list the array's network interfaces.
+    quiet: true
+
+- name: FlashArray facts
+  ansible.builtin.set_fact:
+    fa_network: "{{ fa_info.purefa_info.network | default({}) }}"
+    fa_hosts: "{{ fa_info.purefa_info.hosts | default({}) }}"

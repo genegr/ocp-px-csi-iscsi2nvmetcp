@@ -1,0 +1,17 @@
+---
+# Remove the demo: its namespace, with the StatefulSets and their PVCs (PX deletes the volumes: reclaimPolicy Delete).
+# Needs -e confirm=<demo namespace>.
+- name: Teardown is confirmed
+  ansible.builtin.assert:
+    that: (confirm | default('')) == mig_demo_ns
+    fail_msg: "This deletes namespace {{ mig_demo_ns }} and its volumes: add -e confirm={{ mig_demo_ns }}"
+    quiet: true
+
+- name: Remove the demo namespace
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: "{{ mig_demo_ns }}"
+    state: absent
+    wait: true
+    wait_timeout: 900

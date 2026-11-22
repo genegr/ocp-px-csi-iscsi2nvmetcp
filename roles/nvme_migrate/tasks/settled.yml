@@ -1,0 +1,28 @@
+---
+# Cluster operators settled, a minute for the operators to react, settled again.
+- name: Cluster operators settled
+  kubernetes.core.k8s_info:
+    api_version: config.openshift.io/v1
+    kind: ClusterOperator
+  register: rco
+  until: &settled >-
+    rco.resources | k8s_unhealthy_operators | length == 0
+    and rco.resources | map('k8s_condition', 'Progressing') | select('eq', 'True') | list | length == 0
+  retries: 90
+  delay: 20
+  when: not ansible_check_mode
+
+- name: Give the operators a minute
+  ansible.builtin.pause:
+    seconds: 60
+  when: not ansible_check_mode
+
+- name: Still settled
+  kubernetes.core.k8s_info:
+    api_version: config.openshift.io/v1
+    kind: ClusterOperator
+  register: rco
+  until: *settled
+  retries: 90
+  delay: 20
+  when: not ansible_check_mode

@@ -1,0 +1,39 @@
+---
+# Self-test of the `prep` roll's per-node steps (roll_wait_node.yml) without rebooting anything: it pretends every node
+# started the roll on another rendered config, so each node that is Done and Ready now looks "just brought back", and the
+# real steps wait for it, check it (verify_prepared_node.yml) and note it. Read-only on a healthy, prepared cluster.
+# A node that fails its check pauses the pools, exactly as in the roll (rerun `migrate.yml --tags prep` to unpause).
+#   ansible-playbook playbooks/tools/roll_selftest.yml -e cluster=<name>
+- name: Cluster model and migration model
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - nvme_model
+
+- name: Roll steps, pretending
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig }}"
+  tasks:
+    - name: Every node looks as if it had just changed config
+      ansible.builtin.set_fact:
+        mig_multipath: "{{ prep_multipath | default('Y') }}"
+        roll_verified: []
+        roll_cfg_before: "{{ dict(mig_nodes | map(attribute='hostname') | zip_longest([], fillvalue='pretend-old-config')) }}"
+
+    - name: One step per node, as the roll does
+      ansible.builtin.include_role:
+        name: nvme_hostprep
+        tasks_from: roll_wait_node.yml
+      loop: "{{ mig_nodes }}"
+      loop_control:
+        label: "node {{ ansible_loop.index }} of {{ mig_nodes | length }}"
+        extended: true
+
+    - name: Every node was waited for, checked and noted
+      ansible.builtin.assert:
+        that: roll_verified | sort == (mig_nodes | map(attribute='hostname') | list | sort)
+        fail_msg: "checked {{ roll_verified }} of {{ mig_nodes | map(attribute='hostname') | list }}"
+        success_msg: "the roll steps waited for, checked and noted {{ roll_verified }}"

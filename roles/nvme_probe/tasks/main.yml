@@ -1,0 +1,119 @@
+---
+# One short-lived privileged Pod per node (host network, read-only /etc and /dev/disk/by-id; sysfs and /proc are the
+# host's) prints key=value lines about the node's storage state. Inputs: probe_nodes (mig_nodes entries) and
+# probe_portals (array NVMe/TCP portal IPs the node must reach on 4420; default none). Output: probe_facts, a dict
+# node name -> {key: value}. Verification only, so nothing here reports a change. Skipped under --check (probe_facts {}).
+- name: No probe facts under --check
+  ansible.builtin.set_fact:
+    probe_facts: {}
+  when: ansible_check_mode
+
+- name: Probe
+  when: not ansible_check_mode
+  block:
+    - name: Namespace and tools image
+      ansible.builtin.include_tasks: namespace.yml
+
+    - name: No probe Pods left from an interrupted run
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_check_ns }}"
+        name: "nvme-probe-{{ item.name }}"
+        state: absent
+        wait: true
+      loop: "{{ probe_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: Probe Pod per node
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "nvme-probe-{{ item.name }}"
+            namespace: "{{ mig_check_ns }}"
+          spec:
+            nodeName: "{{ item.hostname }}"
+            hostNetwork: true
+            restartPolicy: Never
+            tolerations: [{operator: Exists}]
+            containers:
+              - name: probe
+                image: "{{ mig_tools_image }}"
+                command: [bash, -c]
+                args: ["{{ probe_script }}"]
+                env: [{name: PORTALS, value: "{{ probe_portals | default([]) | join(' ') }}"}]
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - {name: etc, mountPath: /host/etc, readOnly: true}
+                  - {name: byid, mountPath: /host/by-id, readOnly: true}
+            volumes:
+              - {name: etc, hostPath: {path: /etc}}
+              - {name: byid, hostPath: {path: /dev/disk/by-id}}
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "False"
+          reason: PodCompleted
+        wait_timeout: 300
+      vars:
+        probe_script: |
+          v() { echo "$1=$2"; }
+          v hostnqn "$(cat /host/etc/nvme/hostnqn 2>/dev/null)"
+          v hostid "$(cat /host/etc/nvme/hostid 2>/dev/null)"
+          v iqn "$(sed -n 's/^InitiatorName=//p' /host/etc/iscsi/initiatorname.iscsi 2>/dev/null)"
+          v nvme_tcp_module "$(test -d /sys/module/nvme_tcp && echo yes || echo no)"
+          v nvme_multipath "$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null || echo none)"
+          v cmdline_multipath_n "$(grep -qw nvme_core.multipath=N /proc/cmdline && echo yes || echo no)"
+          v modules_load "$(grep -qx 'nvme_tcp' /host/etc/modules-load.d/nvme_tcp.conf 2>/dev/null && echo yes || echo no)"
+          v iopolicy_rule "$(grep -qx 'ACTION=="add|change", SUBSYSTEM=="nvme-subsystem", ATTR{iopolicy}="queue-depth"' /host/etc/udev/rules.d/99-nvme-iopolicy.rules 2>/dev/null && echo yes || echo no)"
+          v modprobe_conf "$(grep -qx 'options nvme_core multipath=Y' /host/etc/modprobe.d/nvme-tcp.conf 2>/dev/null && echo yes || echo no)"
+          v nvme_stanza "$(grep -rq 'Pure Storage FlashArray' /host/etc/multipath.conf /host/etc/multipath/conf.d 2>/dev/null && echo yes || echo no)"
+          v hostnqn_unit "$(ls /host/etc/systemd/system/*.wants/nvme-unique-hostnqn.service >/dev/null 2>&1 && echo enabled || echo disabled)"
+          v iscsi_sessions "$(ls /sys/class/iscsi_session 2>/dev/null | wc -l)"
+          v iscsi_luns "$(ls -d /sys/class/iscsi_session/session*/device/target*/*/block/* 2>/dev/null | wc -l)"
+          v nvme_ctrls "$(ls -d /sys/class/nvme/nvme* 2>/dev/null | wc -l)"
+          v nvme_transports "$(for c in /sys/class/nvme/nvme*; do cat $c/transport 2>/dev/null; done | sort -u | tr '\n' ',')"
+          v nvme_addresses "$(for c in /sys/class/nvme/nvme*; do cat $c/address 2>/dev/null; done | tr '\n' ';')"
+          v iopolicy "$(cat /sys/class/nvme-subsystem/nvme-subsys*/iopolicy 2>/dev/null | sort -u | tr '\n' ',')"
+          v nvme_byid "$(ls /host/by-id 2>/dev/null | grep -c '^nvme-eui\.')"
+          r=""
+          for p in $PORTALS; do
+            if timeout 3 bash -c "exec 3<>/dev/tcp/$p/4420" 2>/dev/null; then r="$r$p:ok,"; else r="$r$p:fail,"; fi
+          done
+          v reach "$r"
+      loop: "{{ probe_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: Probe output
+      kubernetes.core.k8s_log:
+        namespace: "{{ mig_check_ns }}"
+        name: "nvme-probe-{{ item.name }}"
+      register: probe_log
+      loop: "{{ probe_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Remove the probe Pods
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_check_ns }}"
+        name: "nvme-probe-{{ item.name }}"
+        state: absent
+        wait: true
+      loop: "{{ probe_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: Probe facts per node
+      ansible.builtin.set_fact:
+        probe_facts: >-
+          {{ dict(probe_nodes | map(attribute='name') | zip(probe_log.results | map(attribute='log_lines') | map('kv_lines'))) }}

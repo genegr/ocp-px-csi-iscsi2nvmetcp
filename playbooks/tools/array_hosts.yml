@@ -1,0 +1,42 @@
+---
+# Read-only diagnostic: what purefa_info returns for this cluster's host objects (names, which keys, IQN/NQN, volumes).
+# Only hosts whose name mentions the realm or a storage node are shown; the array is shared, the rest is not our business.
+#   ansible-playbook playbooks/tools/array_hosts.yml -e cluster=<name>
+- name: Cluster model and migration model
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - nvme_model
+
+- name: Hosts of this cluster on the array
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/everpure.flasharray.everpure.flasharray:
+      fa_url: "{{ mig_fa_endpoint }}"
+      api_token: "{{ mig_fa_token }}"
+  tasks:
+    - name: FlashArray hosts and realms
+      ansible.builtin.include_role:
+        name: nvme_array
+        tasks_from: info.yml
+      vars:
+        array_subsets: [hosts]
+
+    - name: Which hosts are ours
+      ansible.builtin.set_fact:
+        ah_pattern: "{{ ([mig_fa_realm] + (mig_nodes | map(attribute='name') | list)) | select() | join('|') }}"
+
+    - name: How many hosts, and which are ours
+      ansible.builtin.debug:
+        msg:
+          - "hosts on the array: {{ fa_hosts | length }}"
+          - "ours (name matches {{ ah_pattern }}): {{ fa_hosts | dict2items | selectattr('key', 'search', ah_pattern) | map(attribute='key') | list }}"
+          - "keys of one host: {{ (fa_hosts.values() | first | default({})).keys() | list }}"
+
+    - name: Ours in full
+      ansible.builtin.debug:
+        msg: "{{ item.key }}: {{ item.value | dict2items | rejectattr('key', 'in', ['performance', 'space']) | items2dict }}"
+      loop: "{{ fa_hosts | dict2items | selectattr('key', 'search', ah_pattern) | list }}"
+      loop_control:
+        label: "{{ item.key }}"

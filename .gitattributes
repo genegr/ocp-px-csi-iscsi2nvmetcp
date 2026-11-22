@@ -1,0 +1,3 @@
+# Always LF, on every platform. The bytes of some files end up on the nodes (roles/nvme_hostprep/files/ is embedded in a
+# MachineConfig: a different byte re-renders it and reboots the pool), and tools/sync.sh is a shell script.
+* text=auto eol=lf

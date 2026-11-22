@@ -1,0 +1,9 @@
+# Local configuration and secrets: real addresses, cluster names, kubeconfig, the array token never go in tracked files
+clusters/*
+!clusters/README.md
+.state/
+.sync.env
+# Working notes and live-test evidence of the lab runs (names and addresses of the test environment): not part of the package
+docs/
+__pycache__/
+*.pyc

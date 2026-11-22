@@ -1,0 +1,205 @@
+---
+# M6, one node (`node`): the reverse of node.yml. Not yet exercised on a live cluster (a drill on one node is optional).
+- name: "{{ node.name }}: where the node is now"
+  block:
+    - name: "{{ node.name }}: Node, StorageNodeInitiator, NodeNetworkState, policy"
+      kubernetes.core.k8s_info:
+        api_version: "{{ item.api }}"
+        kind: "{{ item.kind }}"
+        namespace: "{{ item.ns | default(omit) }}"
+        name: "{{ item.name }}"
+      register: rb_objs
+      loop:
+        - {api: v1, kind: Node, name: "{{ node.hostname }}"}
+        - {api: "{{ mig_sni.api_version }}", kind: "{{ mig_sni.kind }}", name: "{{ node.hostname }}", ns: "{{ mig_ns if mig_sni.scope == 'Namespaced' else omit }}"}
+        - {api: nmstate.io/v1beta1, kind: NodeNetworkState, name: "{{ node.hostname }}"}
+        - {api: nmstate.io/v1, kind: NodeNetworkConfigurationPolicy, name: "{{ mig_nncp_pattern | replace('{node}', node.name) }}"}
+      loop_control:
+        label: "{{ item.kind }}"
+
+    # The network as it was before the migration, recorded by `nodes` (a node moved before that existed has none).
+    - name: "{{ node.name }}: the snapshot of its network before the migration"
+      ansible.builtin.slurp:
+        src: "{{ mig_state_dir }}/before/{{ node.name }}.yaml"
+      register: rb_snap_raw
+      failed_when: false
+
+    - name: "{{ node.name }}: the policy this node should go back to"
+      ansible.builtin.set_fact:
+        rb_before: "{{ (rb_snap_raw.content | b64decode | from_yaml) if rb_snap_raw.content is defined else {} }}"
+        rb_model_spec:
+          nodeSelector:
+            kubernetes.io/hostname: "{{ node.hostname }}"
+          desiredState:
+            interfaces: "{{ node.current_storage | nmstate_storage_interfaces(rb_objs.results[2].resources[0] | nns_ifaces_by_mac) }}"
+
+    # The snapshot's policy is restored as it was; without one (no snapshot, or the node had no policy) it is rebuilt from
+    # networks.current: static IPv4 on each storage NIC.
+    - name: "{{ node.name }}: where the policy comes from"
+      ansible.builtin.set_fact:
+        rb_from_snapshot: "{{ (rb_before.policy | default(none)) is mapping }}"
+        rb_target_spec: "{{ rb_before.policy.spec if (rb_before.policy | default(none)) is mapping else rb_model_spec }}"
+
+    - name: "{{ node.name }}: the policy to restore"
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'taken from the snapshot of ' ~ rb_before.taken ~ ' (' ~ mig_state_dir ~ '/before/' ~ node.name ~ '.yaml)'
+             if rb_from_snapshot else
+             'rebuilt from networks.current (static IPv4 on each storage NIC): no snapshot of a policy for this node' }}
+
+    - name: "{{ node.name }}: state"
+      ansible.builtin.set_fact:
+        rb_labeled: "{{ mig_label_key in (rb_objs.results[0].resources[0].metadata.labels | default({})) }}"
+        rb_san: "{{ (rb_objs.results[1].resources[0].spec.sanTypes | default([])) if rb_objs.results[1].resources | length > 0 else [] }}"
+        rb_net_old: "{{ rb_objs.results[3].resources | length == 1 and rb_objs.results[3].resources[0].spec == rb_target_spec }}"
+
+- name: "{{ node.name }}: already on iSCSI"
+  ansible.builtin.debug:
+    msg: "{{ node.name }}: no label, StorageNodeInitiator {{ rb_san }}, network at the iSCSI addresses: nothing to do"
+  when: not rb_labeled and rb_san != [mig_to_san] and rb_net_old
+
+- name: "{{ node.name }}: roll back"
+  when: (rb_labeled or rb_san == [mig_to_san] or not rb_net_old) and not ansible_check_mode
+  block:
+    - name: "{{ node.name }}: cordon and drain"
+      kubernetes.core.k8s_drain:
+        name: "{{ node.hostname }}"
+        state: drain
+        delete_options:
+          ignore_daemonsets: true
+          delete_emptydir_data: true
+          force: true
+          wait_timeout: "{{ mig_drain_wait | int }}"
+      register: rb_drained
+      until: rb_drained is succeeded
+      retries: 20
+      delay: 30
+
+    - name: "{{ node.name }}: no PX volume attached to the node"
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: VolumeAttachment
+      register: rb_va
+      until: >-
+        rb_va.resources | selectattr('spec.nodeName', 'eq', node.hostname)
+        | selectattr('spec.attacher', 'eq', 'pxd.portworx.com') | list | length == 0
+      retries: 30
+      delay: 10
+
+    # Controllers may outlive their volumes (PX-CSI 26.4 never disconnects them, the 26.2 runbook says it does on detach):
+    # what must be gone is every NVMe namespace, seen as a nvme-eui link in /dev/disk/by-id.
+    - name: "{{ node.name }}: no NVMe namespace left on the node"
+      ansible.builtin.include_tasks: probe_wait.yml
+      vars:
+        probe_cond: "{{ nd_facts.nvme_byid | int == 0 }}"
+        probe_what: no NVMe namespace is left
+        probe_tries: 6
+        probe_delay: 20
+
+    - name: "{{ node.name }}: namespaces are gone"
+      ansible.builtin.assert:
+        that: probe_ok
+        fail_msg: "{{ node.name }} still has {{ nd_facts.nvme_byid }} NVMe namespaces after the drain: {{ nd_facts }}"
+        quiet: true
+
+    - name: "{{ node.name }}: BREAKPOINT, the operator changes the network back"
+      ansible.builtin.pause:
+        prompt: "{{ mig_rollback_prompt }}"
+      register: rb_pause
+
+    - name: "{{ node.name }}: the breakpoint waited"
+      ansible.builtin.assert:
+        that: "'not interactive' not in (rb_pause.stdout | default(''))"
+        fail_msg: "stdin was not a terminal, so the breakpoint did not wait. Rerun interactively."
+        quiet: true
+
+    - name: "{{ node.name }}: storage network policy with the iSCSI addresses"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: nmstate.io/v1
+          kind: NodeNetworkConfigurationPolicy
+          metadata:
+            name: "{{ mig_nncp_pattern | replace('{node}', node.name) }}"
+            labels:
+              app.kubernetes.io/managed-by: ocp-px-csi-migration
+          spec: "{{ rb_target_spec }}"
+      when: not rb_net_old
+
+    - name: "{{ node.name }}: the node reports the iSCSI addresses"
+      kubernetes.core.k8s_info:
+        api_version: nmstate.io/v1beta1
+        kind: NodeNetworkState
+        name: "{{ node.hostname }}"
+      register: rb_nns
+      until: rb_nns.resources | length == 1 and rb_nns.resources[0] | nns_has_addresses(node.current_storage)
+      retries: 30
+      delay: 10
+
+    - name: "{{ node.name }}: label removed"
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Node
+          metadata:
+            name: "{{ node.hostname }}"
+            labels: "{{ {mig_label_key: none} }}"
+
+    - name: "{{ node.name }}: node plugin pod before"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_ns }}"
+        label_selectors: [app.kubernetes.io/component=node-plugin]
+        field_selectors: ["spec.nodeName={{ node.hostname }}"]
+      register: rb_plugin_before
+
+    - name: "{{ node.name }}: delete the node plugin pod (it re-reads the SAN type only at startup)"
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_ns }}"
+        name: "{{ item.metadata.name }}"
+        state: absent
+        wait: true
+      loop: "{{ rb_plugin_before.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "{{ node.name }}: replacement node plugin pod ready"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_ns }}"
+        label_selectors: [app.kubernetes.io/component=node-plugin]
+        field_selectors: ["spec.nodeName={{ node.hostname }}"]
+      register: rb_plugin
+      until: >-
+        rb_plugin.resources | length == 1
+        and rb_plugin.resources[0].metadata.uid not in (rb_plugin_before.resources | map(attribute='metadata.uid') | list)
+        and rb_plugin.resources[0] | k8s_condition('Ready') == 'True'
+      retries: 60
+      delay: 10
+
+    - name: "{{ node.name }}: StorageNodeInitiator back to ISCSI"
+      kubernetes.core.k8s_info:
+        api_version: "{{ mig_sni.api_version }}"
+        kind: "{{ mig_sni.kind }}"
+        namespace: "{{ mig_ns if mig_sni.scope == 'Namespaced' else omit }}"
+        name: "{{ node.hostname }}"
+      register: rb_sni
+      until: rb_sni.resources | length == 1 and (rb_sni.resources[0].spec.sanTypes | default([])) == ['ISCSI']
+      retries: 30
+      delay: 10
+
+    - name: "{{ node.name }}: uncordon"
+      kubernetes.core.k8s_drain:
+        name: "{{ node.hostname }}"
+        state: uncordon
+
+    - name: "{{ node.name }}: cluster settled"
+      ansible.builtin.include_tasks: settled.yml
+
+    - name: "{{ node.name }}: attach check over iSCSI"
+      ansible.builtin.include_tasks: verify_node.yml
+      vars:
+        verify_protocol: iscsi

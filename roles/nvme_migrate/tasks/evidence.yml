@@ -1,0 +1,32 @@
+---
+# The report the operator reads at the end of a phase (nodes, finalize) and of playbooks/tools/attach_check.yml: for every
+# node whose attach check passed in this run, what the test Pods, the node and the array showed (verify_node.yml keeps it in
+# `mig_evidence`; a failed check stops the run with its own message, so only passes are here). A node of this run without
+# an attach check is named, never left out silently.
+- name: Attach-check evidence per node
+  ansible.builtin.debug:
+    msg: "{{ [header] + pod_lines + node_lines + array_lines }}"
+  vars:
+    e: "{{ item.value }}"
+    header: "{{ item.key }}: ATTACH CHECK PASSED over {{ 'NVMe/TCP' if e.protocol == 'nvme' else 'iSCSI' }} ({{ e.at }}), {{ e.pods | length }} test Pods with their own PVCs, pinned to the node"
+    pod_lines: "{{ ['test Pod | /data device | checksum read back'] + (e.pods | zip(e.devices, e.data) | map('join', ' | ') | list) }}"
+    node_lines: >-
+      {{ ['node: ' ~ e.controllers ~ ' NVMe controllers over ' ~ e.transport ~ ' (' ~ e.expected_controllers ~ ' array portals expected) to '
+          ~ (e.traddrs | join(', ')) ~ '; native multipath ' ~ e.multipath ~ ', I/O policy ' ~ e.iopolicy ~ ', ' ~ e.by_id ~ ' nvme-eui links']
+         if e.protocol == 'nvme' else
+         ['node: ' ~ e.sessions ~ ' iSCSI sessions, ' ~ e.luns ~ ' LUNs'] }}
+    array_lines: "{{ ['array: host ' ~ e.array_host ~ ' (' ~ ('NQN' if e.protocol == 'nvme' else 'IQN') ~ ' ' ~ (e.array_id | join(', ')) ~ ') has ' ~ (e.array_matched | length) ~ ' of ' ~ (e.pvs | length) ~ ' test volumes connected, ' ~ e.array_connections ~ ' volumes in all'] }}"
+  loop: "{{ mig_evidence | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Nodes of this run without an attach check
+  ansible.builtin.debug:
+    msg: >-
+      No attach check in this run for {{ ev_missing | join(', ') }} (already on NVMe/TCP when the run began, or not reached).
+      `ansible-playbook playbooks/tools/attach_check.yml -e cluster={{ mig_cluster }} -e 'verify_nodes={{ ev_missing | to_json }}'`
+      runs it on demand.
+  vars:
+    ev_scope: "{{ mig_nodes | selectattr('name', 'in', verify_nodes | default(migrate_nodes | default(mig_nodes | map(attribute='name') | list))) | map(attribute='name') | list }}"
+    ev_missing: "{{ ev_scope | difference(mig_evidence | default({}) | list) }}"
+  when: ev_missing | length > 0

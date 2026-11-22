@@ -1,0 +1,62 @@
+---
+# M6: back to iSCSI. The StorageCluster goes back to the snapshot taken by `enable` (env and spec.nodes), then every
+# node that is on NVMe/TCP is walked back: drain, wait for no volume, BREAKPOINT to move the NICs back to the iSCSI
+# networks, NMState with the iSCSI addresses (networks.current), label removed, node plugin pod restarted, uncordon,
+# attach check over iSCSI. Tag `rollback` is `never`: it only runs when asked for, with -e confirm=<cluster>.
+# -e rollback_nodes='["master1"]' limits the walk to some nodes (by mig_nodes name).
+- name: Real runs need -e confirm=<cluster>
+  ansible.builtin.assert:
+    that: ansible_check_mode or (confirm | default('')) == mig_cluster
+    fail_msg: "Rolling back drains the nodes: after --check and the user's go-ahead, add -e confirm={{ mig_cluster }}"
+    quiet: true
+
+- name: The snapshot taken before the migration
+  ansible.builtin.slurp:
+    src: "{{ mig_state_dir }}/storagecluster-before.yaml"
+  register: rb_snap
+  failed_when: false
+
+- name: There is a snapshot to go back to
+  ansible.builtin.assert:
+    that: rb_snap.content is defined
+    fail_msg: "No {{ mig_state_dir }}/storagecluster-before.yaml: `enable` writes it, so there is nothing to roll back to"
+    quiet: true
+
+- name: What to restore
+  ansible.builtin.set_fact:
+    rb_spec: "{{ (rb_snap.content | b64decode | from_yaml).spec }}"
+
+- name: StorageCluster back to the snapshot's env and nodes
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: core.libopenstorage.org/v1
+      kind: StorageCluster
+      metadata:
+        name: "{{ mig_sc.metadata.name }}"
+        namespace: "{{ mig_ns }}"
+      spec: "{{ {'env': rb_spec.env | default([]), 'nodes': (rb_spec.nodes if rb_spec.nodes | default([]) | length > 0 else none)} }}"
+    merge_type: merge
+  when: (mig_sc.spec.env | default([])) != (rb_spec.env | default([])) or (mig_sc.spec.nodes | default([])) != (rb_spec.nodes | default([]))
+  register: rb_patched
+
+- name: A cluster-wide env change restarts the node plugins on their own
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ mig_ns }}"
+    label_selectors: [app.kubernetes.io/component=node-plugin]
+  register: rb_plugins
+  until: >-
+    rb_plugins.resources | length == mig_nodes | length
+    and rb_plugins.resources | map('k8s_condition', 'Ready') | unique | list == ['True']
+    and rb_plugins.resources | map(attribute='metadata.uid') | list | intersect(mig_plugin_pods | map(attribute='metadata.uid') | list) | length == 0
+  retries: 60
+  delay: 10
+  when: rb_patched.changed and mig_stage in ['final', 'finalizing'] and not ansible_check_mode
+
+- name: Walk the nodes back
+  ansible.builtin.include_tasks: rollback_node.yml
+  loop: "{{ mig_nodes | selectattr('name', 'in', rollback_nodes | default(mig_nodes | map(attribute='name') | list)) | list }}"
+  loop_control:
+    loop_var: node
+    label: "{{ node.name }}"

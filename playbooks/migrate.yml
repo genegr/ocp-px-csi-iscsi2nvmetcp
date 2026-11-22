@@ -1,0 +1,90 @@
+---
+# PX-CSI iSCSI -> NVMe/TCP on a running cluster. Phases are tags; with no
+# tag only the read-only preflight runs. Every phase that changes something is `never` until named, and takes
+# `--check` first (and -e confirm=<cluster> for the real run of prep, nodes, finalize, rollback).
+#
+#   preflight   read-only gate: cluster and PX health, PX-CSI >= 26.3, array NVMe/TCP portals, baseline node facts
+#   prep        M2: nvme_tcp at boot, unique hostnqn, multipath mode (udev iopolicy) as MachineConfig; ROLLING REBOOT
+#   enable      M3: StorageCluster spec.nodes override for the label (cluster env stays iSCSI); restarts nothing
+#   nodes       M4: per node: cordon, drain, BREAKPOINT (the VLAN change), NMState, label, node plugin pod, uncordon,
+#               attach check. Interactive (needs a terminal). -e migrate_nodes=master0 limits it
+#   finalize    M5: cluster env NVMEOF-TCP, iSCSI variables, node override and labels removed
+#   rollback    M6: back to iSCSI from the snapshot taken by `enable`
+# The demo workloads and their verification are playbooks/demo.yml; playbooks/verify.yml reports the state.
+- name: Cluster model and migration model
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - nvme_model
+  tags: always
+
+- name: PX-CSI migration to NVMe/TCP
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig }}"
+    group/everpure.flasharray.everpure.flasharray:
+      fa_url: "{{ mig_fa_endpoint }}"
+      api_token: "{{ mig_fa_token }}"
+  tasks:
+    - name: Preflight
+      ansible.builtin.include_role:
+        name: nvme_preflight
+        tasks_from: checks.yml
+        apply:
+          tags: [preflight, prep, enable, nodes, finalize, rollback]
+      tags: [preflight, prep, enable, nodes, finalize, rollback]
+
+    - name: M2 host preparation for NVMe/TCP (MachineConfig, rolling reboot)
+      ansible.builtin.include_role:
+        name: nvme_hostprep
+        apply:
+          tags: [prep]
+      tags: [prep, never]
+
+    - name: M3 StorageCluster node override
+      ansible.builtin.include_role:
+        name: nvme_migrate
+        tasks_from: enable.yml
+        apply:
+          tags: [enable]
+      tags: [enable, never]
+
+    - name: M4 migrate the nodes, one at a time
+      ansible.builtin.include_role:
+        name: nvme_migrate
+        tasks_from: node.yml
+        apply:
+          tags: [nodes]
+      loop: "{{ mig_nodes | selectattr('name', 'in', migrate_nodes | default(mig_nodes | map(attribute='name') | list)) | list }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.name }}"
+      tags: [nodes, never]
+
+    # What the attach checks of this run proved, per node (test Pods, node, array): the report to read before going on.
+    - name: M4 evidence report
+      ansible.builtin.include_role:
+        name: nvme_migrate
+        tasks_from: evidence.yml
+        apply:
+          tags: [nodes]
+      when: not ansible_check_mode
+      tags: [nodes, never]
+
+    - name: M5 StorageCluster for NVMe/TCP
+      ansible.builtin.include_role:
+        name: nvme_migrate
+        tasks_from: finalize.yml
+        apply:
+          tags: [finalize]
+      tags: [finalize, never]
+
+    - name: M6 back to iSCSI
+      ansible.builtin.include_role:
+        name: nvme_migrate
+        tasks_from: rollback.yml
+        apply:
+          tags: [rollback]
+      tags: [rollback, never]

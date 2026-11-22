@@ -1,0 +1,90 @@
+---
+# M3: add the node override to the StorageCluster. Nothing restarts: no node carries the label yet, and a node plugin
+# pod doesn't restart on a spec.nodes[].env change anyway (multi-SAN doc). The cluster-level env stays iSCSI.
+# The live object is the source: our entry is merged into spec.nodes, other entries stay, and the first snapshot of the
+# object is kept for rollback.
+- name: The cluster is at the baseline (or already enabled)
+  ansible.builtin.assert:
+    that: mig_stage in ['baseline', 'enabled']
+    fail_msg: "StorageCluster stage is {{ mig_stage }}: enable only applies to an iSCSI cluster"
+    quiet: true
+
+- name: Env of the nodes that migrate
+  ansible.builtin.set_fact:
+    # The SAN type; plus the portal filter when the array has NVMe/TCP portals the nodes will not reach (without
+    # multi-interface PX connects to every portal of the array it learns about).
+    mig_node_env: >-
+      {{ [{'name': 'PURE_FLASHARRAY_SAN_TYPE', 'value': mig_to_san}]
+         + ([{'name': 'PURE_NVME_ALLOWED_CIDRS', 'value': mig_cidrs | join(',')}] if mig_node_cidr_env | bool else []) }}
+
+- name: spec.nodes with our entry
+  ansible.builtin.set_fact:
+    mig_nodes_new: "{{ (mig_sc.spec.nodes | default([])) | px_nodes_with(mig_label_key | px_nodes_entry(mig_label_value, mig_node_env), mig_label_key) }}"
+    mig_override_ok: "{{ (mig_sc.spec.nodes | default([])) | px_node_override_ok(mig_label_key, mig_node_env) }}"
+
+- name: State directory
+  ansible.builtin.file:
+    path: "{{ mig_state_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: The StorageCluster as it is now (rollback restores it; the first snapshot is kept)
+  ansible.builtin.copy:
+    dest: "{{ mig_state_dir }}/storagecluster-before.yaml"
+    content: >-
+      {{ {'apiVersion': mig_sc.apiVersion, 'kind': mig_sc.kind,
+          'metadata': {'name': mig_sc.metadata.name, 'namespace': mig_sc.metadata.namespace},
+          'spec': mig_sc.spec} | to_nice_yaml }}
+    force: false
+    mode: "0600"
+  when: mig_stage == 'baseline'
+
+- name: Node plugin pods before
+  ansible.builtin.set_fact:
+    plugin_uids_before: "{{ mig_plugin_pods | map(attribute='metadata.uid') | sort }}"
+
+- name: spec.nodes override for the label {{ mig_label_key }}={{ mig_label_value }}
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: core.libopenstorage.org/v1
+      kind: StorageCluster
+      metadata:
+        name: "{{ mig_sc.metadata.name }}"
+        namespace: "{{ mig_ns }}"
+      spec:
+        nodes: "{{ mig_nodes_new }}"
+    merge_type: merge
+  when: not mig_override_ok
+  register: sc_patched
+
+- name: The operator did not restart anything
+  when: sc_patched.changed and not ansible_check_mode
+  block:
+    - name: Give the operator a minute to react (it should not)
+      ansible.builtin.pause:
+        seconds: 60
+
+    - name: Node plugin pods and StorageCluster after
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_ns }}"
+        label_selectors: [app.kubernetes.io/component=node-plugin]
+      register: plugin_after
+
+    - name: Same pods, StorageCluster still running
+      kubernetes.core.k8s_info:
+        api_version: core.libopenstorage.org/v1
+        kind: StorageCluster
+        namespace: "{{ mig_ns }}"
+        name: "{{ mig_sc.metadata.name }}"
+      register: sc_after
+      until: sc_after.resources | length == 1 and (sc_after.resources[0].status.phase | default('')) in ['Running', 'Online']
+      retries: 30
+      delay: 10
+
+    - name: No node plugin pod was restarted by the override
+      ansible.builtin.assert:
+        that: plugin_after.resources | map(attribute='metadata.uid') | sort == plugin_uids_before
+        fail_msg: "Node plugin pods changed after adding spec.nodes: {{ plugin_after.resources | map(attribute='metadata.name') | list }}"
+        quiet: true

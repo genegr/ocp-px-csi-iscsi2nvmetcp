@@ -1,0 +1,129 @@
+---
+# M5: the whole cluster on NVMe/TCP, in the StorageCluster the way the multi-SAN doc ends: PURE_FLASHARRAY_SAN_TYPE
+# NVMEOF-TCP at cluster level, the iSCSI variables gone, our spec.nodes entry and node labels removed.
+# PURE_NVME_ALLOWED_CIDRS is added only when enable put it in the node override (the array has NVMe/TCP portals outside
+# the target networks, mig_node_cidr_env): dropping the entry must not lose that filter. Otherwise it filters nothing.
+# The change of spec.env restarts the node plugin pods by itself. Computed from the live object: only the iSCSI
+# settings and our entry are dropped.
+- name: Real runs need -e confirm=<cluster>
+  ansible.builtin.assert:
+    that: ansible_check_mode or (confirm | default('')) == mig_cluster
+    fail_msg: "This restarts every node plugin: after --check and the user's go-ahead, add -e confirm={{ mig_cluster }}"
+    quiet: true
+
+- name: Stage
+  ansible.builtin.assert:
+    that: mig_stage in ['enabled', 'finalizing', 'final']
+    fail_msg: "StorageCluster stage is {{ mig_stage }}: finalize follows the node migration (stage enabled)"
+    quiet: true
+
+- name: Every storage node is on NVMe/TCP
+  kubernetes.core.k8s_info:
+    api_version: "{{ mig_sni.api_version }}"
+    kind: "{{ mig_sni.kind }}"
+    namespace: "{{ mig_ns if mig_sni.scope == 'Namespaced' else omit }}"
+    name: "{{ item.hostname }}"
+  register: fin_sni
+  loop: "{{ mig_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: All nodes report NVMEOF-TCP
+  ansible.builtin.assert:
+    that: fin_sni.results | map(attribute='resources') | map('first') | map(attribute='spec.sanTypes') | map('join', ',') | unique | list == [mig_to_san]
+    fail_msg: "Not every node is on NVMe/TCP yet: {{ fin_sni.results | map(attribute='resources') | map('first') | map(attribute='spec.sanTypes') | list }}"
+    quiet: true
+
+- name: Final env and nodes
+  ansible.builtin.set_fact:
+    mig_env_final: >-
+      {%- set env = mig_sc.spec.env | default([]) | px_env_drop_iscsi | px_env_set('PURE_FLASHARRAY_SAN_TYPE', mig_to_san) -%}
+      {{ env | px_env_set('PURE_NVME_ALLOWED_CIDRS', mig_cidrs | join(',')) if mig_node_cidr_env | bool else env }}
+    mig_nodes_final: "{{ (mig_sc.spec.nodes | default([])) | px_nodes_without(mig_label_key) }}"
+
+- name: Node plugin pods before
+  ansible.builtin.set_fact:
+    plugin_uids_before: "{{ mig_plugin_pods | map(attribute='metadata.uid') | sort }}"
+
+- name: StorageCluster env for NVMe/TCP, iSCSI settings and our node override removed
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: core.libopenstorage.org/v1
+      kind: StorageCluster
+      metadata:
+        name: "{{ mig_sc.metadata.name }}"
+        namespace: "{{ mig_ns }}"
+      # nodes: null deletes the key (JSON merge patch) when nothing else is left in it
+      spec: "{{ {'env': mig_env_final, 'nodes': (mig_nodes_final if mig_nodes_final | length > 0 else none)} }}"
+    merge_type: merge
+  when: (mig_sc.spec.env | default([])) != mig_env_final or (mig_sc.spec.nodes | default([])) != mig_nodes_final
+  register: fin_patched
+
+- name: The node plugins restart on their own and come back
+  when: fin_patched.changed and not ansible_check_mode
+  block:
+    - name: Every node plugin pod is new and ready
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_ns }}"
+        label_selectors: [app.kubernetes.io/component=node-plugin]
+      register: fin_plugins
+      until: >-
+        fin_plugins.resources | length == mig_nodes | length
+        and fin_plugins.resources | map(attribute='metadata.uid') | list | intersect(plugin_uids_before) | length == 0
+        and fin_plugins.resources | map('k8s_condition', 'Ready') | unique | list == ['True']
+      retries: 60
+      delay: 10
+
+    - name: StorageCluster running
+      kubernetes.core.k8s_info:
+        api_version: core.libopenstorage.org/v1
+        kind: StorageCluster
+        namespace: "{{ mig_ns }}"
+        name: "{{ mig_sc.metadata.name }}"
+      register: fin_sc
+      until: fin_sc.resources | length == 1 and (fin_sc.resources[0].status.phase | default('')) in ['Running', 'Online']
+      retries: 60
+      delay: 20
+
+- name: Node labels removed
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Node
+      metadata:
+        name: "{{ item.hostname }}"
+        labels: "{{ {mig_label_key: none} }}"
+  loop: "{{ mig_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Still NVMe/TCP on every node (StorageNodeInitiator)
+  kubernetes.core.k8s_info:
+    api_version: "{{ mig_sni.api_version }}"
+    kind: "{{ mig_sni.kind }}"
+    namespace: "{{ mig_ns if mig_sni.scope == 'Namespaced' else omit }}"
+    name: "{{ item.hostname }}"
+  register: fin_sni2
+  until: fin_sni2.resources | length == 1 and (fin_sni2.resources[0].spec.sanTypes | default([])) == [mig_to_san]
+  retries: 30
+  delay: 10
+  loop: "{{ mig_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not ansible_check_mode
+
+- name: Attach check on every node over NVMe/TCP
+  ansible.builtin.include_tasks: verify_node.yml
+  vars:
+    verify_protocol: nvme
+  loop: "{{ mig_nodes }}"
+  loop_control:
+    loop_var: node
+    label: "{{ node.name }}"
+  when: not ansible_check_mode
+
+- name: Evidence of the attach checks
+  ansible.builtin.include_tasks: evidence.yml
+  when: not ansible_check_mode

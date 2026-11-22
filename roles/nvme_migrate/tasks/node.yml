@@ -1,0 +1,351 @@
+---
+# M4, one node (`node` is a mig_nodes entry): iSCSI -> NVMe/TCP following the multi-SAN doc (cordon, drain, node
+# override, delete the node plugin pod, check the StorageNodeInitiator, uncordon) plus the VLAN change in the middle:
+# the node's storage NICs move to the NVMe/TCP networks while it is drained: a VLAN change on the node's switch ports,
+# which a human does at the breakpoint (the lab's way of doing it is in the config's operator_note). Resumable: a node that is done is skipped, one interrupted after
+# the network change continues without asking again.
+- name: "{{ node.name }}: where the node is now"
+  block:
+    - name: "{{ node.name }}: Node"
+      kubernetes.core.k8s_info:
+        kind: Node
+        name: "{{ node.hostname }}"
+      register: nd_node
+
+    - name: "{{ node.name }}: StorageNodeInitiator"
+      kubernetes.core.k8s_info:
+        api_version: "{{ mig_sni.api_version }}"
+        kind: "{{ mig_sni.kind }}"
+        namespace: "{{ mig_ns if mig_sni.scope == 'Namespaced' else omit }}"
+        name: "{{ node.hostname }}"
+      register: nd_sni
+
+    - name: "{{ node.name }}: NodeNetworkState and policy"
+      kubernetes.core.k8s_info:
+        api_version: "{{ item.api }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
+      register: nd_net
+      loop:
+        - {api: nmstate.io/v1beta1, kind: NodeNetworkState, name: "{{ node.hostname }}"}
+        - {api: nmstate.io/v1, kind: NodeNetworkConfigurationPolicy, name: "{{ mig_nncp_pattern | replace('{node}', node.name) }}"}
+      loop_control:
+        label: "{{ item.kind }}"
+
+    - name: "{{ node.name }}: the policy this node should end with"
+      ansible.builtin.set_fact:
+        nd_target_spec:
+          nodeSelector:
+            kubernetes.io/hostname: "{{ node.hostname }}"
+          desiredState:
+            interfaces: "{{ node.target_storage | nmstate_storage_interfaces(nd_net.results[0].resources[0] | nns_ifaces_by_mac) }}"
+
+    - name: "{{ node.name }}: state"
+      ansible.builtin.set_fact:
+        nd_labeled: "{{ (nd_node.resources[0].metadata.labels | default({}))[mig_label_key] | default('') == mig_label_value }}"
+        nd_san: "{{ (nd_sni.resources[0].spec.sanTypes | default([])) if nd_sni.resources | length > 0 else [] }}"
+        nd_net_done: "{{ nd_net.results[1].resources | length == 1 and nd_net.results[1].resources[0].spec == nd_target_spec }}"
+        # the storage NICs still carry the configured current addresses: the node's network is as it was before the migration
+        nd_on_current: "{{ nd_net.results[0].resources | length == 1 and (nd_net.results[0].resources[0] | nns_has_addresses(node.current_storage)) }}"
+
+    - name: "{{ node.name }}: migrated already?"
+      ansible.builtin.set_fact:
+        nd_migrated: "{{ nd_labeled and nd_san == [mig_to_san] and nd_net_done }}"
+
+- name: "{{ node.name }}: already on NVMe/TCP"
+  ansible.builtin.debug:
+    msg: "{{ node.name }}: labelled, StorageNodeInitiator {{ nd_san }}, network at the target: nothing to do"
+  when: nd_migrated
+
+- name: "{{ node.name }}: plan (check mode)"
+  ansible.builtin.debug:
+    msg:
+      - "first, if the storage NICs still have their current addresses: the node's network (NodeNetworkState of the NICs, the policy) is saved to {{ mig_state_dir }}/before/{{ node.name }}.yaml (kept, never overwritten): a rollback restores it"
+      - "{{ node.name }}: cordon and drain; wait for no PX volume on the node (VolumeAttachments, array host, iSCSI LUNs)"
+      - "BREAKPOINT: the operator moves the storage NICs from {{ node.nics | map(attribute='old') | map(attribute='name') | list }} to {{ node.nics | map(attribute='new') | map(attribute='name') | list }}"
+      - "NNCP {{ mig_nncp_pattern | replace('{node}', node.name) }}: {{ node.target_storage | map(attribute='address') | list }}; reach portals {{ mig_portal_ips }}"
+      - "label {{ mig_label_key }}={{ mig_label_value }}; delete the node plugin pod; StorageNodeInitiator == {{ [mig_to_san] }}; uncordon; attach check"
+  when: not nd_migrated and ansible_check_mode
+
+- name: "{{ node.name }}: migrate"
+  when: not nd_migrated and not ansible_check_mode
+  block:
+    - name: "{{ node.name }}: real runs need -e confirm=<cluster>"
+      ansible.builtin.assert:
+        that: (confirm | default('')) == mig_cluster
+        fail_msg: "This drains {{ node.name }} and waits for the network change: after --check and the user's go-ahead, add -e confirm={{ mig_cluster }}"
+        quiet: true
+
+    # Before the drain: the node's identity, and whether an earlier run already moved the network.
+    - name: "{{ node.name }}: facts and reachability of the array's NVMe/TCP portals"
+      ansible.builtin.include_role:
+        name: nvme_probe
+      vars:
+        probe_nodes: ["{{ node }}"]
+        probe_portals: "{{ mig_portal_ips }}"
+
+    - name: "{{ node.name }}: is the network change done already? (policy at the target and every portal reachable)"
+      ansible.builtin.set_fact:
+        nd_facts: "{{ probe_facts[node.name] }}"
+        nd_swap_done: >-
+          {{ nd_net_done and ((probe_facts[node.name].reach | default('')).split(',') | select('match', '.*:ok$') | list | length)
+             == (mig_portal_ips | length) }}
+
+    # Before anything changes: what this node's network is now, kept for a rollback. The first snapshot stays: a node whose
+    # NICs are already off their current addresses (the change was started before) cannot be recorded any more.
+    - name: "{{ node.name }}: directory for the before-state of the nodes"
+      ansible.builtin.file:
+        path: "{{ mig_state_dir }}/before"
+        state: directory
+        mode: "0700"
+
+    - name: "{{ node.name }}: its storage network as it is now (a rollback restores it; the first snapshot is kept)"
+      ansible.builtin.copy:
+        dest: "{{ mig_state_dir }}/before/{{ node.name }}.yaml"
+        content: >-
+          {{ node | mig_before_snapshot(nd_net.results[0].resources[0], nd_net.results[1].resources | first | default(none),
+                                        now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')) | to_nice_yaml }}
+        force: false
+        mode: "0600"
+      when: nd_on_current
+
+    - name: "{{ node.name }}: the before-state of its network"
+      ansible.builtin.stat:
+        path: "{{ mig_state_dir }}/before/{{ node.name }}.yaml"
+      register: nd_before
+
+    - name: "{{ node.name }}: no node moves without its network on record"
+      ansible.builtin.assert:
+        that: nd_before.stat.exists or not nd_on_current
+        fail_msg: "{{ node.name }}: its network could not be recorded in {{ mig_state_dir }}/before/{{ node.name }}.yaml: nothing is changed, because a rollback would have nothing to restore"
+        quiet: true
+
+    - name: "{{ node.name }}: not on record (the change was started before it could be)"
+      ansible.builtin.debug:
+        msg: "{{ node.name }}: there is no snapshot of its network and its NICs are no longer on their current addresses: a rollback rebuilds the policy from networks.current"
+      when: not nd_before.stat.exists
+
+    # Before anything changes: a go/no-go for this node, and the proof that there is a terminal for the breakpoint. Without
+    # one `pause` does not wait, and the run would otherwise find out only after the node is drained.
+    - name: "{{ node.name }}: start? (needs a terminal: ssh -t, docker compose run without -T)"
+      ansible.builtin.pause:
+        prompt: "{{ mig_start_prompt }}"
+      register: start_pause
+
+    - name: "{{ node.name }}: there is a terminal, nothing was changed without one"
+      ansible.builtin.assert:
+        that: "'not interactive' not in (start_pause.stdout | default(''))"
+        fail_msg: >-
+          stdin is not a terminal, so the breakpoint could not wait. Nothing was drained. Run the nodes phase interactively:
+          ssh -t to the jump box and `docker compose run` without -T (route A), or a normal shell (route B).
+        quiet: true
+
+    - name: "{{ node.name }}: cordon and drain"
+      kubernetes.core.k8s_drain:
+        name: "{{ node.hostname }}"
+        state: drain
+        delete_options:
+          ignore_daemonsets: true
+          delete_emptydir_data: true
+          # Masters run unmanaged static-pod guard Pods (etcd-guard, ...): their operators recreate them.
+          force: true
+          wait_timeout: "{{ mig_drain_wait | int }}"
+      # A PodDisruptionBudget can block an eviction for a while (a Pod moved by the previous node's drain): retry.
+      register: nd_drained
+      until: nd_drained is succeeded
+      retries: 20
+      delay: 30
+
+    - name: "{{ node.name }}: the network change"
+      when: not nd_swap_done
+      block:
+        - name: "{{ node.name }}: no PX volume attached to the node"
+          kubernetes.core.k8s_info:
+            api_version: storage.k8s.io/v1
+            kind: VolumeAttachment
+          register: nd_va
+          until: >-
+            nd_va.resources | selectattr('spec.nodeName', 'eq', node.hostname)
+            | selectattr('spec.attacher', 'eq', 'pxd.portworx.com') | list | length == 0
+          retries: 30
+          delay: 10
+
+        # Doc: a host registered with NVMe credentials cannot connect to a volume previously attached via iSCSI. The
+        # connections must be gone before the protocol changes. purefa_info may not report a host's volumes: then the
+        # VolumeAttachments above are the evidence.
+        - name: "{{ node.name }}: the node's host object on the array holds no volume"
+          everpure.flasharray.purefa_info:
+            gather_subset: [hosts]
+          register: nd_fa
+          check_mode: false
+          no_log: true
+          until: (nd_fa.purefa_info.hosts | fa_host_with('iqn', nd_facts.iqn) | fa_host_connections) in [0, -1]
+          retries: 18
+          delay: 10
+
+        # Sessions alone prove nothing: the iSCSI sessions of a node outlive its last volume (a test node kept four
+        # after an earlier smoke test) and are harmless. What must be gone is every LUN behind them.
+        - name: "{{ node.name }}: no iSCSI LUN left on the node"
+          ansible.builtin.include_tasks: probe_wait.yml
+          vars:
+            probe_cond: "{{ nd_facts.iscsi_luns | int == 0 }}"
+            probe_what: no iSCSI LUN is left
+            probe_tries: 6
+            probe_delay: 20
+
+        - name: "{{ node.name }}: iSCSI LUNs are gone"
+          ansible.builtin.assert:
+            that: probe_ok
+            fail_msg: "{{ node.name }} still has {{ nd_facts.iscsi_luns }} iSCSI LUNs after the drain: {{ nd_facts }}"
+            quiet: true
+
+        - name: "{{ node.name }}: BREAKPOINT, the operator changes the network"
+          ansible.builtin.pause:
+            prompt: "{{ mig_swap_prompt }}"
+          register: swap_pause
+
+        - name: "{{ node.name }}: the breakpoint waited (it needs a terminal: ssh -t, docker compose run without -T)"
+          ansible.builtin.assert:
+            that: "'not interactive' not in (swap_pause.stdout | default(''))"
+            fail_msg: "stdin was not a terminal, so the breakpoint did not wait. Rerun the nodes phase interactively."
+            quiet: true
+
+        - name: "{{ node.name }}: storage network policy with the NVMe/TCP addresses"
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: nmstate.io/v1
+              kind: NodeNetworkConfigurationPolicy
+              metadata:
+                name: "{{ mig_nncp_pattern | replace('{node}', node.name) }}"
+                labels:
+                  app.kubernetes.io/managed-by: ocp-px-csi-migration
+              spec: "{{ nd_target_spec }}"
+          when: not nd_net_done
+
+        - name: "{{ node.name }}: the node reports the new addresses"
+          kubernetes.core.k8s_info:
+            api_version: nmstate.io/v1beta1
+            kind: NodeNetworkState
+            name: "{{ node.hostname }}"
+          register: nd_nns
+          until: nd_nns.resources | length == 1 and nd_nns.resources[0] | nns_has_addresses(node.target_storage)
+          retries: 30
+          delay: 10
+
+        - name: "{{ node.name }}: policy applied"
+          kubernetes.core.k8s_info:
+            api_version: nmstate.io/v1
+            kind: NodeNetworkConfigurationPolicy
+            name: "{{ mig_nncp_pattern | replace('{node}', node.name) }}"
+          register: nd_nncp
+          until: nd_nncp.resources | length == 1 and nd_nncp.resources[0] | k8s_condition('Available') == 'True'
+          retries: 30
+          delay: 10
+
+        - name: "{{ node.name }}: every array NVMe/TCP portal answers from the node"
+          ansible.builtin.include_tasks: probe_wait.yml
+          vars:
+            probe_portals: "{{ mig_portal_ips }}"
+            probe_cond: >-
+              {{ (nd_facts.reach | default('')).split(',') | select('match', '.*:ok$') | list | length == mig_portal_ips | length }}
+            probe_what: every NVMe/TCP portal answers on 4420
+            probe_tries: 8
+            probe_delay: 15
+
+        - name: "{{ node.name }}: portals reachable"
+          ansible.builtin.assert:
+            that: probe_ok
+            fail_msg: >-
+              {{ node.name }} cannot reach the array's NVMe/TCP portals on 4420 ({{ nd_facts.reach | default('no probe') }}).
+              Check the network (VLAN) behind its storage NICs and the addresses {{ node.target_storage | map(attribute='address') | list }}.
+            quiet: true
+
+    - name: "{{ node.name }}: switch the node to NVMe/TCP"
+      when: not (nd_labeled and nd_san == [mig_to_san])
+      block:
+        - name: "{{ node.name }}: label {{ mig_label_key }}={{ mig_label_value }}"
+          kubernetes.core.k8s:
+            definition:
+              apiVersion: v1
+              kind: Node
+              metadata:
+                name: "{{ node.hostname }}"
+                labels: "{{ {mig_label_key: mig_label_value} }}"
+
+        - name: "{{ node.name }}: node plugin pod before"
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Pod
+            namespace: "{{ mig_ns }}"
+            label_selectors: [app.kubernetes.io/component=node-plugin]
+            field_selectors: ["spec.nodeName={{ node.hostname }}"]
+          register: nd_plugin_before
+
+        - name: "{{ node.name }}: delete the node plugin pod (it does not restart on its own when spec.nodes[].env changes)"
+          kubernetes.core.k8s:
+            api_version: v1
+            kind: Pod
+            namespace: "{{ mig_ns }}"
+            name: "{{ item.metadata.name }}"
+            state: absent
+            wait: true
+          loop: "{{ nd_plugin_before.resources }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+
+        - name: "{{ node.name }}: replacement node plugin pod ready"
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Pod
+            namespace: "{{ mig_ns }}"
+            label_selectors: [app.kubernetes.io/component=node-plugin]
+            field_selectors: ["spec.nodeName={{ node.hostname }}"]
+          register: nd_plugin
+          until: >-
+            nd_plugin.resources | length == 1
+            and nd_plugin.resources[0].metadata.uid not in (nd_plugin_before.resources | map(attribute='metadata.uid') | list)
+            and nd_plugin.resources[0] | k8s_condition('Ready') == 'True'
+          retries: 60
+          delay: 10
+
+        - name: "{{ node.name }}: what the node plugin detected at startup"
+          kubernetes.core.k8s_log:
+            namespace: "{{ mig_ns }}"
+            name: "{{ nd_plugin.resources[0].metadata.name }}"
+            container: "{{ mig_plugin_container }}"
+          register: nd_plugin_log
+
+        # The plugin reads nvme_core.multipath once and caches it (runbook): it must agree with the kernel.
+        - name: "{{ node.name }}: the cached multipath mode is the kernel's"
+          ansible.builtin.assert:
+            that: nd_plugin_log.log_lines | select('search', want) | list | length > 0
+            fail_msg: >-
+              The node plugin did not log '{{ want }}' (nvme_core.multipath={{ nd_facts.nvme_multipath }} on the node).
+              Last lines: {{ nd_plugin_log.log_lines | select('search', 'ultipath') | list | last | default('none') }}
+            quiet: true
+          vars:
+            want: "{{ 'Detected native NVMe multipath mode' if nd_facts.nvme_multipath == 'Y' else 'Detected DM-multipath mode' }}"
+
+        - name: "{{ node.name }}: StorageNodeInitiator reports {{ mig_to_san }}"
+          kubernetes.core.k8s_info:
+            api_version: "{{ mig_sni.api_version }}"
+            kind: "{{ mig_sni.kind }}"
+            namespace: "{{ mig_ns if mig_sni.scope == 'Namespaced' else omit }}"
+            name: "{{ node.hostname }}"
+          register: nd_sni_now
+          until: nd_sni_now.resources | length == 1 and (nd_sni_now.resources[0].spec.sanTypes | default([])) == [mig_to_san]
+          retries: 30
+          delay: 10
+
+    - name: "{{ node.name }}: uncordon"
+      kubernetes.core.k8s_drain:
+        name: "{{ node.hostname }}"
+        state: uncordon
+
+    - name: "{{ node.name }}: cluster settled"
+      ansible.builtin.include_tasks: settled.yml
+
+    - name: "{{ node.name }}: attach check over NVMe/TCP"
+      ansible.builtin.include_tasks: verify_node.yml
+      vars:
+        verify_protocol: nvme

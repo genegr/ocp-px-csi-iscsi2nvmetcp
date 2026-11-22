@@ -1,0 +1,39 @@
+---
+# One step of the roll: wait until the MCO has brought the next node back (state Done, Ready, on a new rendered config),
+# check it right away (verify_prepared_node.yml), and note it. The caller runs one step per node, in order. A node that
+# comes back wrong pauses the pools before the next one is rebooted; a node the MCO reports Degraded stops the wait at
+# once. The `when` is on a block INSIDE the included file on purpose: a `when` on include_tasks only governs the include,
+# and an include_tasks loop is expanded up front, so it could not tell a later step that an earlier one did the work.
+- name: Wait for the next node and check it
+  when: roll_verified | length < mig_nodes | length
+  block:
+    - name: Wait for the MCO to bring the next node back
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: roll_nodes
+      until: >-
+        roll_nodes.resources | mco_fresh_nodes(roll_cfg_before, roll_verified, mig_nodes | map(attribute='hostname') | list) | length > 0
+        or roll_nodes.resources | mco_degraded_nodes(mig_nodes | map(attribute='hostname') | list) | length > 0
+      retries: 60
+      delay: 25
+
+    - name: The MCO has not given up on a node
+      ansible.builtin.assert:
+        that: roll_nodes.resources | mco_degraded_nodes(mig_nodes | map(attribute='hostname') | list) | length == 0
+        fail_msg: "The MCO reports {{ roll_nodes.resources | mco_degraded_nodes(mig_nodes | map(attribute='hostname') | list) }} Degraded: look at the node's machine-config-daemon before going on."
+        quiet: true
+
+    - name: Nodes just brought back that are not checked yet
+      ansible.builtin.set_fact:
+        roll_fresh: "{{ mig_nodes | selectattr('hostname', 'in', roll_nodes.resources | mco_fresh_nodes(roll_cfg_before, roll_verified, mig_nodes | map(attribute='hostname') | list)) | list }}"
+
+    - name: Check each node that came back
+      ansible.builtin.include_tasks: verify_prepared_node.yml
+      loop: "{{ roll_fresh }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.name }}"
+
+    - name: Nodes checked so far
+      ansible.builtin.set_fact:
+        roll_verified: "{{ roll_verified + (roll_fresh | map(attribute='hostname') | list) }}"

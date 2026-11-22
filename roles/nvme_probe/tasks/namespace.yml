@@ -1,0 +1,26 @@
+---
+# The namespace for probe and attach-check Pods (privileged pod security) and the
+# release's own tools image (ImageStreamTag openshift/tools:latest), which every Pod of this project uses.
+- name: Check namespace
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ mig_check_ns }}"
+        labels:
+          app.kubernetes.io/managed-by: ocp-px-csi-migration
+          pod-security.kubernetes.io/enforce: privileged
+          security.openshift.io/scc.podSecurityLabelSync: "false"
+
+- name: Tools image of this release
+  kubernetes.core.k8s_info:
+    api_version: image.openshift.io/v1
+    kind: ImageStreamTag
+    namespace: openshift
+    name: tools:latest
+  register: tools_ist
+
+- name: Tools image reference
+  ansible.builtin.set_fact:
+    mig_tools_image: "{{ tools_ist.resources[0].image.dockerImageReference }}"

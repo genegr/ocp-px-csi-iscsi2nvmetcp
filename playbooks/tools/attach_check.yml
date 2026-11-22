@@ -1,0 +1,57 @@
+---
+# The attach check of the migration, on demand and on any node: test Pods with their own fresh PVCs pinned to the node,
+# the device behind /data and the payload's checksum, the node's controllers or sessions, the node's host object on the
+# array holding every test volume. Ends with the same evidence report as the nodes phase. It creates 1 GiB PVCs (PX makes the
+# array volumes) and removes them again; nothing else changes. The protocol expected is read from the node (the label
+# of the migration: nvme, else iscsi); `-e protocol=nvme|iscsi` overrides it.
+#   ansible-playbook playbooks/tools/attach_check.yml -e cluster=<name> [-e 'verify_nodes=["master0"]'] [-e protocol=nvme|iscsi]
+- name: Cluster model and migration model
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - nvme_model
+
+- name: Attach check
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: "{{ kubeconfig }}"
+    group/everpure.flasharray.everpure.flasharray:
+      fa_url: "{{ mig_fa_endpoint }}"
+      api_token: "{{ mig_fa_token }}"
+  tasks:
+    - name: Nodes
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: ac_nodes
+
+    - name: The array's NVMe/TCP interfaces
+      ansible.builtin.include_role:
+        name: nvme_array
+        tasks_from: info.yml
+      vars:
+        array_subsets: [network]
+
+    - name: Portals the nodes should reach
+      ansible.builtin.set_fact:
+        mig_portal_ips: "{{ fa_network | nvme_portals(mig_cidrs) | rejectattr('cidr', 'eq', '') | map(attribute='address') | list }}"
+
+    - name: Attach check on each node
+      ansible.builtin.include_role:
+        name: nvme_migrate
+        tasks_from: verify_node.yml
+      vars:
+        verify_protocol: >-
+          {{ protocol | default('nvme' if (((ac_nodes.resources | selectattr('metadata.name', 'eq', node.hostname) | first).metadata.labels | default({}))[mig_label_key] | default('')) == mig_label_value else 'iscsi') }}
+      loop: "{{ mig_nodes | selectattr('name', 'in', verify_nodes | default(mig_nodes | map(attribute='name') | list)) | list }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.name }}"
+      when: not ansible_check_mode
+
+    - name: Evidence report
+      ansible.builtin.include_role:
+        name: nvme_migrate
+        tasks_from: evidence.yml
+      when: not ansible_check_mode

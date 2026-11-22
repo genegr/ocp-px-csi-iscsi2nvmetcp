@@ -1,0 +1,260 @@
+---
+# M2: make every storage node ready for NVMe/TCP while it keeps serving iSCSI. One MachineConfig per pool,
+# 99-<pool>-pure-nvme-prep, labelled managed-by=ocp-px-csi-migration. It only ADDS what iSCSI-only nodes lack; whatever
+# configures iSCSI on the nodes (iscsid, multipathd, iface records, multipath.conf) is left alone:
+#   nvme_tcp loaded at boot     the PX-CSI node plugin reads nvme_core.multipath ONCE at startup and caches it; without
+#                               nvme_core loaded it silently falls back to DM mode (runbook "NVMe Native Multipath")
+#   unique /etc/nvme/hostnqn    a unit deriving it from the SMBIOS UUID (a cloned image shares one NQN: one array host object)
+#   multipath mode Y (native)   udev rule iopolicy=queue-depth (Pure's NVMe/TCP guide, verbatim) + nvme_core multipath=Y
+#   multipath mode N (DM)       the Pure NVMe device stanza as a drop-in, /etc/multipath/conf.d/pure-nvme.conf, so the
+#                               node's own multipath.conf is not overwritten (not exercised here: this cluster is native)
+# The reboot is the MCO's: one node at a time.
+- name: Real runs need -e confirm=<cluster> (every node of the pool reboots)
+  ansible.builtin.assert:
+    that: ansible_check_mode or (confirm | default('')) == mig_cluster
+    fail_msg: "This reboots every storage node: after --check and the user's go-ahead, add -e confirm={{ mig_cluster }}"
+    quiet: true
+
+- name: Multipath mode the nodes run (native NVMe multipath = Y), from the live cmdline unless configured
+  ansible.builtin.set_fact:
+    mig_multipath: >-
+      {{ mig_multipath_cfg if mig_multipath_cfg != 'auto'
+         else ('N' if (probe_facts.values() | map(attribute='cmdline_multipath_n') | list | unique) == ['yes'] else 'Y') }}
+
+- name: The nodes agree on the multipath mode
+  ansible.builtin.assert:
+    that: probe_facts.values() | map(attribute='cmdline_multipath_n') | list | unique | length <= 1
+    fail_msg: "Mixed nvme_core.multipath on the nodes: {{ probe_facts }}"
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Pools before the change
+  kubernetes.core.k8s_info:
+    api_version: machineconfiguration.openshift.io/v1
+    kind: MachineConfigPool
+    name: "{{ item }}"
+  register: mcp_before
+  loop: "{{ mig_mc_pools }}"
+
+- name: Pools this project paused after a failed per-node check are unpaused (this run retries)
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: machineconfiguration.openshift.io/v1
+      kind: MachineConfigPool
+      metadata:
+        name: "{{ item.metadata.name }}"
+        annotations: "{{ {'ocp-px-csi-migration/paused': none} }}"
+      spec:
+        paused: false
+    merge_type: merge
+  loop: "{{ mcp_before.results | map(attribute='resources') | map('first') | list | mco_paused_pools }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Nodes at the start of the roll
+  kubernetes.core.k8s_info:
+    kind: Node
+  register: roll_nodes0
+
+- name: What each node runs now, and nothing checked yet
+  ansible.builtin.set_fact:
+    roll_cfg_before: "{{ roll_nodes0.resources | mco_current_configs }}"
+    roll_verified: []
+
+- name: NVMe preparation MachineConfig per pool
+  kubernetes.core.k8s:
+    definition:
+      apiVersion: machineconfiguration.openshift.io/v1
+      kind: MachineConfig
+      metadata:
+        name: "99-{{ item }}-pure-nvme-prep"
+        labels:
+          machineconfiguration.openshift.io/role: "{{ item }}"
+          app.kubernetes.io/managed-by: ocp-px-csi-migration
+      spec:
+        config:
+          ignition:
+            version: 3.2.0
+          storage:
+            files: "{{ mig_mc_files }}"
+          systemd:
+            units: "{{ mig_mc_units }}"
+  loop: "{{ mig_mc_pools }}"
+  register: prep_mc
+  vars:
+    # Real block scalars (each ends in one newline): a "\n" typed inside a Jinja string in a folded scalar is NOT
+    # unescaped and would land in the file as a backslash and an n (found in the first --check, decoded by hand).
+    mig_modules_load: |
+      nvme_tcp
+    mig_udev_rule: |
+      ACTION=="add|change", SUBSYSTEM=="nvme-subsystem", ATTR{iopolicy}="queue-depth"
+    mig_modprobe_conf: |
+      options nvme_core multipath=Y
+    # Mode N: the NVMe device stanza from Pure's host preparation page (what DM multipath needs for NVMe namespaces).
+    mig_nvme_stanza: |
+      devices {
+      	device {
+      		vendor                "NVME"
+      		product               "Pure Storage FlashArray"
+      		path_selector         "queue-length 0"
+      		path_grouping_policy  group_by_prio
+      		prio                  ana
+      		failback              immediate
+      		fast_io_fail_tmo      10
+      		user_friendly_names   no
+      		no_path_retry         0
+      		features              0
+      		dev_loss_tmo          60
+      	}
+      }
+    mig_mc_files: >-
+      {{ [mig_modules_load | ign_file('/etc/modules-load.d/nvme_tcp.conf')]
+         + ([mig_udev_rule | ign_file('/etc/udev/rules.d/99-nvme-iopolicy.rules'),
+             mig_modprobe_conf | ign_file('/etc/modprobe.d/nvme-tcp.conf')]
+            if mig_multipath == 'Y' else
+            [mig_nvme_stanza | ign_file('/etc/multipath/conf.d/pure-nvme.conf')]) }}
+    mig_mc_units:
+      - name: nvme-unique-hostnqn.service
+        enabled: true
+        contents: "{{ lookup('ansible.builtin.file', 'nvme-unique-hostnqn.service') }}"
+
+# A change that renders to the same config never produces a new render: bounded wait.
+- name: Controller rendered the changed MachineConfig
+  kubernetes.core.k8s_info:
+    api_version: machineconfiguration.openshift.io/v1
+    kind: MachineConfigPool
+    name: "{{ item.0 }}"
+  register: mcp_render
+  until: (mcp_render.resources[0].spec.configuration.name | default('')) != (item.1.resources[0].spec.configuration.name | default(''))
+  retries: 12
+  delay: 10
+  failed_when: false
+  loop: "{{ mig_mc_pools | zip(mcp_before.results, prep_mc.results) }}"
+  loop_control:
+    label: "{{ item.0 }}"
+  when: item.2.changed and not ansible_check_mode
+
+# A roll happens only if the controller rendered a new config for a pool (an unchanged MachineConfig renders nothing).
+- name: Pools after the render
+  kubernetes.core.k8s_info:
+    api_version: machineconfiguration.openshift.io/v1
+    kind: MachineConfigPool
+    name: "{{ item }}"
+  register: pool_now
+  loop: "{{ mig_mc_pools }}"
+  when: not ansible_check_mode
+
+- name: Is a roll going to happen?
+  ansible.builtin.set_fact:
+    roll_expected: >-
+      {{ pool_now.results | map(attribute='resources') | map('first') | map(attribute='spec.configuration.name') | list
+         != mcp_before.results | map(attribute='resources') | map('first') | map(attribute='spec.configuration.name') | list }}
+  when: not ansible_check_mode
+
+# The MCO reboots one node at a time. One step per node: wait until the MCO has it back, check it right away
+# (verify_prepared_node.yml; a failing node pauses the pools before the next reboot), note it. Each wait is an `until`
+# poll of the Nodes every 25 s (at most 25 min per node), so nothing runs after the last node, and nothing at all when
+# no roll was expected.
+- name: Roll, checking each node as soon as the MCO has brought it back
+  ansible.builtin.include_tasks: roll_wait_node.yml
+  loop: "{{ mig_nodes }}"
+  loop_control:
+    label: "node {{ ansible_loop.index }} of {{ mig_nodes | length }}"
+    extended: true
+  when: not ansible_check_mode and roll_expected | default(false) | bool
+
+- name: Pools rolled out
+  kubernetes.core.k8s_info:
+    api_version: machineconfiguration.openshift.io/v1
+    kind: MachineConfigPool
+    name: "{{ item }}"
+  register: mcp
+  until: "[mcp.resources[0]] | mco_pools_rolled([item])"
+  retries: 60
+  delay: 20
+  loop: "{{ mig_mc_pools }}"
+  when: not ansible_check_mode
+
+- name: Every node of the roll was checked as it came back
+  ansible.builtin.assert:
+    that: roll_verified | length == mig_nodes | length
+    fail_msg: "Nodes checked as they came back: {{ roll_verified }} of {{ mig_nodes | map(attribute='hostname') | list }}"
+    quiet: true
+  when: not ansible_check_mode and roll_expected | default(false) | bool
+
+- name: Verify
+  when: not ansible_check_mode
+  block:
+    - name: Cluster operators settled after the roll
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: ClusterOperator
+      register: rco
+      until: >-
+        rco.resources | k8s_unhealthy_operators | length == 0
+        and rco.resources | map('k8s_condition', 'Progressing') | select('eq', 'True') | list | length == 0
+      retries: 90
+      delay: 20
+
+    - name: StorageCluster back to Running
+      kubernetes.core.k8s_info:
+        api_version: core.libopenstorage.org/v1
+        kind: StorageCluster
+        namespace: "{{ mig_ns }}"
+        name: "{{ mig_sc.metadata.name }}"
+      register: sc_now
+      until: sc_now.resources | length == 1 and (sc_now.resources[0].status.phase | default('')) in ['Running', 'Online']
+      retries: 60
+      delay: 20
+
+    - name: Node facts after the roll
+      ansible.builtin.include_role:
+        name: nvme_probe
+      vars:
+        probe_nodes: "{{ mig_nodes }}"
+        probe_portals: []
+
+    - name: Every node is prepared for NVMe/TCP and still serves iSCSI
+      ansible.builtin.assert:
+        that:
+          - probe_facts.values() | map(attribute='nvme_tcp_module') | list | unique == ['yes']
+          - probe_facts.values() | map(attribute='modules_load') | list | unique == ['yes']
+          - probe_facts.values() | map(attribute='hostnqn_unit') | list | unique == ['enabled']
+          - probe_facts.values() | map(attribute='hostnqn') | list | unique | length == mig_nodes | length
+          - probe_facts.values() | map(attribute='hostnqn') | select('match', '^nqn\.') | list | length == mig_nodes | length
+          - probe_facts.values() | map(attribute='hostid') | list | unique | length == mig_nodes | length
+          - probe_facts.values() | map(attribute='iqn') | list | unique | length == mig_nodes | length
+          - probe_facts.values() | map(attribute='nvme_multipath') | list | unique == [mig_multipath]
+          - mig_multipath != 'Y' or probe_facts.values() | map(attribute='iopolicy_rule') | list | unique == ['yes']
+          - mig_multipath != 'Y' or probe_facts.values() | map(attribute='modprobe_conf') | list | unique == ['yes']
+          - mig_multipath != 'N' or probe_facts.values() | map(attribute='nvme_stanza') | list | unique == ['yes']
+        fail_msg: "{{ probe_facts | to_json }}"
+        success_msg: >-
+          {{ probe_facts | dict2items | map(attribute='key') | zip(probe_facts.values() | map(attribute='hostnqn')) | map('join', ' ') | list }}
+          nvme_core.multipath={{ mig_multipath }}
+
+    - name: Node plugin pods after the roll
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mig_ns }}"
+        label_selectors: [app.kubernetes.io/component=node-plugin]
+      register: plugin_now
+
+    - name: What each node plugin detected at startup (information only, an iSCSI plugin may not log it)
+      kubernetes.core.k8s_log:
+        namespace: "{{ mig_ns }}"
+        name: "{{ item.metadata.name }}"
+        container: "{{ mig_plugin_container }}"
+      register: plugin_log
+      failed_when: false
+      loop: "{{ plugin_now.resources }}"
+      loop_control:
+        label: "{{ item.spec.nodeName }}"
+
+    - name: Detected multipath modes
+      ansible.builtin.debug:
+        msg: "{{ item.item.spec.nodeName }}: {{ item.log_lines | default([]) | select('search', 'ultipath mode') | list or 'no multipath mode line (iSCSI plugin)' }}"
+      loop: "{{ plugin_log.results }}"
+      loop_control:
+        label: "{{ item.item.spec.nodeName }}"
