@@ -1,4 +1,4 @@
-# PX-CSI iSCSI → NVMe/TCP migration
+# PX-CSI iSCSI to NVMe/TCP migration
 
 Moves the volumes of a running Red Hat® OpenShift® cluster's Portworx® CSI (PX-CSI) from iSCSI to NVMe®/TCP on the same
 Everpure FlashArray™ product, one node at a time, with PX-CSI's multi-SAN protocol feature (`StorageCluster.spec.nodes[].env`,
