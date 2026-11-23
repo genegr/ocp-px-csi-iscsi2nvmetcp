@@ -21,7 +21,7 @@
     # -e verify_demo=false skips the demo, which is not meant to be healthy while a node is being rebooted.
     - name: Only the nodes asked for
       ansible.builtin.set_fact:
-        mig_nodes: "{{ mig_nodes | selectattr('name', 'in', verify_nodes) | list }}"
+        mig_nodes: "{{ mig_nodes | mig_pick_nodes(verify_nodes) }}"
       when: verify_nodes is defined
 
     - name: Live StorageCluster, CRDs and node plugin pods

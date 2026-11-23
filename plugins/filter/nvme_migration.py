@@ -167,6 +167,36 @@ def mig_before_snapshot(node, nns, nncp, taken=""):
     return {"node": node["name"], "hostname": node["hostname"], "taken": str(taken), "policy": policy, "storage_nics": nics}
 
 
+def mig_pick_nodes(nodes, selection=None):
+    """The entries of `nodes` (the model's node list) that `selection` names, matched by exact name, in the config's order.
+
+    `selection` is what `-e migrate_nodes=...` (also rollback_nodes and verify_nodes) gives: nothing (all nodes), a list of names,
+    or a string. Ansible delivers `-e key=value` and `-e 'key=["a","b"]'` as a string, never as a list, so a string is read as a JSON
+    list or as names separated by commas. Matching is exact: `node1` must not select `node10`, which `in` on that string would.
+    A name that is not a node of the config, or an empty selection, is an error: a typo never selects nothing or the wrong node."""
+    if selection is None:
+        return list(nodes)
+    if isinstance(selection, str):
+        text = selection.strip()
+        if text.startswith("["):
+            try:
+                selection = json.loads(text)
+            except ValueError:
+                _die(f"node selection {text!r} is not a JSON list: give node names as a, b or [\"a\", \"b\"]")
+        else:
+            selection = text.split(",")
+    if not isinstance(selection, (list, tuple)) or not all(isinstance(s, str) for s in selection):
+        _die(f"node selection {selection!r}: expected a list of node names")
+    wanted = [s.strip() for s in selection if s.strip()]
+    if not wanted:
+        _die("node selection is empty: name at least one node, or leave it out for all of them")
+    names = [n["name"] for n in nodes]
+    unknown = [s for s in wanted if s not in names]
+    if unknown:
+        _die(f"node selection: {', '.join(unknown)} is not a node of the config (nodes: {', '.join(names)})")
+    return [n for n in nodes if n["name"] in wanted]
+
+
 # --- the array PX-CSI itself uses: its secret and its StorageClass ----------------------------------------------------------
 def fa_from_secret(secret, endpoint):
     """The px-pure-secret (a Secret resource, or None) and the array address the config names -> {error, realm, endpoints}.
@@ -501,6 +531,7 @@ class FilterModule:
         return {
             "mig_model": mig_model,
             "mig_before_snapshot": mig_before_snapshot,
+            "mig_pick_nodes": mig_pick_nodes,
             "fa_from_secret": fa_from_secret,
             "fa_pod_path": fa_pod_path,
             "nvme_portals": nvme_portals,

@@ -168,8 +168,9 @@ Rules the tool enforces:
 - **Run every phase with `--check` first** (a dry run: it prints the plan and creates nothing). `prep`, `nodes`, `finalize` and
   `rollback` refuse to run without `-e confirm=<name>`, so adding it is a decision, not a habit.
 - **`nodes` asks "start?" before it drains anything.** Without a terminal it stops there with the node untouched. Limit it to some
-  nodes with `-e migrate_nodes=<node>` (or `-e 'migrate_nodes=["a","b"]'`). A node that is done is skipped, and a node interrupted
-  after the network change carries on without asking again.
+  nodes with `-e migrate_nodes=<node>` (or `-e 'migrate_nodes=["a","b"]'`, or `a,b`); the same goes for `rollback_nodes` and
+  `verify_nodes`. Names are matched exactly as they are in the config, and a name that is not in it stops the run before anything
+  is touched. A node that is done is skipped, and a node interrupted after the network change carries on without asking again.
 - A second run of `prep`, `enable`, `nodes` or `finalize` reports `changed=0`.
 - To read an interactive run afterwards, keep a log: route A adds `-e ANSIBLE_LOG_PATH=/work/.state/<name>-nodes.log` to
   `docker compose run`; route B sets `ANSIBLE_LOG_PATH=.state/<name>-nodes.log`.

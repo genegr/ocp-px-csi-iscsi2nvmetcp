@@ -18,7 +18,7 @@ from nvme_k8s import (k8s_condition, k8s_csinodes_with_driver, k8s_node_readines
                       kv_lines, nmstate_storage_interfaces, nns_ifaces_by_mac)
 from nvme_migration import (addrs_in_cidrs, crd_has_path, crd_ref, fa_from_secret, fa_host_connections,  # noqa: E402
                             fa_host_volumes_for, fa_host_with, fa_pod_path, ign_file, image_version_ge, mco_current_configs, mco_degraded_nodes, mco_fresh_nodes,
-                            mco_paused_by_us, mco_paused_pools, mco_pools_rolled, mig_before_snapshot, mig_model, mig_stage,
+                            mco_paused_by_us, mco_paused_pools, mco_pools_rolled, mig_before_snapshot, mig_model, mig_pick_nodes, mig_stage,
                             nns_has_addresses, node_plugin_container, nvme_portals, probe_traddrs, px_env_drop_iscsi,
                             px_env_get, px_env_set, px_node_override_ok, px_nodes_entry, px_nodes_with,
                             px_nodes_without)
@@ -179,6 +179,45 @@ try:
     check("snapshot: a NIC missing from the NodeNetworkState is refused", False)
 except AnsibleFilterError as exc:
     check("snapshot: a NIC missing from the NodeNetworkState is refused (nothing to record)", "nothing to record" in str(exc))
+
+# --- picking nodes by name (-e migrate_nodes / rollback_nodes / verify_nodes) -------------------------------------------------
+# Ansible hands `-e key=value` and `-e 'key=["a"]'` over as strings, and `in` on a string is a substring test: node10 once selected node1.
+many = [{"name": n} for n in ("node1", "node2", "node10")]
+
+
+def pick(sel):
+    return [n["name"] for n in mig_pick_nodes(many, sel)]
+
+
+check("pick nodes: no selection is every node, in the config's order", pick(None) == ["node1", "node2", "node10"])
+check("pick nodes: a list of names, returned in the config's order", pick(["node10", "node1"]) == ["node1", "node10"])
+check("pick nodes: -e key=name (a string) matches the exact name: node1 is not node10, and node10 is not node1",
+      pick("node10") == ["node10"] and pick("node1") == ["node1"])
+check("pick nodes: -e 'key=[\"a\",\"b\"]' (a string holding JSON) matches exact names too",
+      pick('["node10"]') == ["node10"] and pick('["node2", "node1"]') == ["node1", "node2"])
+check("pick nodes: names separated by commas, spaces allowed", pick("node1, node2") == ["node1", "node2"])
+check("pick nodes: a name given twice selects the node once", pick("node2,node2") == ["node2"])
+check("pick nodes: the selected entries are the model's own", mig_pick_nodes(many, "node2") == [many[1]])
+
+
+def pick_refused(name, sel, fragment):
+    try:
+        mig_pick_nodes(many, sel)
+    except AnsibleFilterError as exc:
+        check(f"pick nodes: {name} is refused ({fragment})", fragment in str(exc))
+        return
+    check(f"pick nodes: {name} should have been refused", False)
+
+
+pick_refused("a prefix of a name is not a node", "node", "not a node of the config")
+pick_refused("the refusal lists the nodes there are", "node", "nodes: node1, node2, node10")
+pick_refused("a typo in a list", ["node1", "nod2"], "nod2")
+pick_refused("an empty list", [], "empty")
+pick_refused("an empty string", "", "empty")
+pick_refused("separators only", " , ", "empty")
+pick_refused("broken JSON", '["node1"', "not a JSON list")
+pick_refused("a list of something else", [1, 2], "expected a list")
+pick_refused("a mapping", {"node1": True}, "expected a list")
 
 # --- Kubernetes object readers ------------------------------------------------------------------------------------------
 res = {"status": {"conditions": [{"type": "Ready", "status": "True"}, {"type": "Degraded", "status": "False"}]}}

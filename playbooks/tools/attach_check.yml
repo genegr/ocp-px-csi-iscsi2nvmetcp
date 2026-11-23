@@ -44,7 +44,7 @@
       vars:
         verify_protocol: >-
           {{ protocol | default('nvme' if (((ac_nodes.resources | selectattr('metadata.name', 'eq', node.hostname) | first).metadata.labels | default({}))[mig_label_key] | default('')) == mig_label_value else 'iscsi') }}
-      loop: "{{ mig_nodes | selectattr('name', 'in', verify_nodes | default(mig_nodes | map(attribute='name') | list)) | list }}"
+      loop: "{{ mig_nodes | mig_pick_nodes(verify_nodes | default(none)) }}"
       loop_control:
         loop_var: node
         label: "{{ node.name }}"

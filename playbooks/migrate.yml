@@ -7,7 +7,8 @@
 #   prep        M2: nvme_tcp at boot, unique hostnqn, multipath mode (udev iopolicy) as MachineConfig; ROLLING REBOOT
 #   enable      M3: StorageCluster spec.nodes override for the label (cluster env stays iSCSI); restarts nothing
 #   nodes       M4: per node: cordon, drain, BREAKPOINT (the VLAN change), NMState, label, node plugin pod, uncordon,
-#               attach check. Interactive (needs a terminal). -e migrate_nodes=master0 limits it
+#               attach check. Interactive (needs a terminal). -e migrate_nodes=master0 limits it (exact node names,
+#               `a,b` or '["a","b"]' for several; a name that is not in the config stops the run before any node is touched)
 #   finalize    M5: cluster env NVMEOF-TCP, iSCSI variables, node override and labels removed
 #   rollback    M6: back to iSCSI from the snapshot taken by `enable`
 # The demo workloads and their verification are playbooks/demo.yml; playbooks/verify.yml reports the state.
@@ -57,7 +58,7 @@
         tasks_from: node.yml
         apply:
           tags: [nodes]
-      loop: "{{ mig_nodes | selectattr('name', 'in', migrate_nodes | default(mig_nodes | map(attribute='name') | list)) | list }}"
+      loop: "{{ mig_nodes | mig_pick_nodes(migrate_nodes | default(none)) }}"
       loop_control:
         loop_var: node
         label: "{{ node.name }}"

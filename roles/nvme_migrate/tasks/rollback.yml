@@ -3,12 +3,17 @@
 # node that is on NVMe/TCP is walked back: drain, wait for no volume, BREAKPOINT to move the NICs back to the iSCSI
 # networks, NMState with the iSCSI addresses (networks.current), label removed, node plugin pod restarted, uncordon,
 # attach check over iSCSI. Tag `rollback` is `never`: it only runs when asked for, with -e confirm=<cluster>.
-# -e rollback_nodes='["master1"]' limits the walk to some nodes (by mig_nodes name).
+# -e rollback_nodes='["master1"]' (or master1, or a,b) limits the walk to some nodes, by exact mig_nodes name.
 - name: Real runs need -e confirm=<cluster>
   ansible.builtin.assert:
     that: ansible_check_mode or (confirm | default('')) == mig_cluster
     fail_msg: "Rolling back drains the nodes: after --check and the user's go-ahead, add -e confirm={{ mig_cluster }}"
     quiet: true
+
+# Resolved here, before the StorageCluster is touched: a name that is not a node of the config stops the run with nothing changed.
+- name: The nodes this run walks back
+  ansible.builtin.set_fact:
+    rb_nodes: "{{ mig_nodes | mig_pick_nodes(rollback_nodes | default(none)) }}"
 
 - name: The snapshot taken before the migration
   ansible.builtin.slurp:
@@ -56,7 +61,7 @@
 
 - name: Walk the nodes back
   ansible.builtin.include_tasks: rollback_node.yml
-  loop: "{{ mig_nodes | selectattr('name', 'in', rollback_nodes | default(mig_nodes | map(attribute='name') | list)) | list }}"
+  loop: "{{ rb_nodes }}"
   loop_control:
     loop_var: node
     label: "{{ node.name }}"

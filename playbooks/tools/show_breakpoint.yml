@@ -34,7 +34,7 @@
       ansible.builtin.include_role:
         name: nvme_migrate
         tasks_from: show_breakpoint.yml
-      loop: "{{ mig_nodes | selectattr('name', 'in', verify_nodes | default(mig_nodes | map(attribute='name') | list)) | list }}"
+      loop: "{{ mig_nodes | mig_pick_nodes(verify_nodes | default(none)) }}"
       loop_control:
         loop_var: node
         label: "{{ node.name }}"

@@ -27,6 +27,6 @@
       `ansible-playbook playbooks/tools/attach_check.yml -e cluster={{ mig_cluster }} -e 'verify_nodes={{ ev_missing | to_json }}'`
       runs it on demand.
   vars:
-    ev_scope: "{{ mig_nodes | selectattr('name', 'in', verify_nodes | default(migrate_nodes | default(mig_nodes | map(attribute='name') | list))) | map(attribute='name') | list }}"
+    ev_scope: "{{ mig_nodes | mig_pick_nodes(verify_nodes | default(migrate_nodes | default(none))) | map(attribute='name') | list }}"
     ev_missing: "{{ ev_scope | difference(mig_evidence | default({}) | list) }}"
   when: ev_missing | length > 0
