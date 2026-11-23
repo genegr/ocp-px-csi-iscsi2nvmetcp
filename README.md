@@ -279,7 +279,8 @@ docker/, compose.yaml        the toolbox image and its pinned requirements
 tests/model_test.py          offline tests
 .state/                      kubeconfig, token file, per-cluster snapshots, logs (never committed)
 ```
-For maintainers: [CLAUDE.md](CLAUDE.md) holds the project's rules and the gotchas found during the live runs.
+For maintainers: [CLAUDE.md](CLAUDE.md) holds the project's rules and the gotchas found during the live runs, and
+[.claude/skills/](.claude/skills/) the procedures for changing, testing, versioning and publishing it.
 
 ## License
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE), and the [Disclaimer](#disclaimer) at the top of this page.

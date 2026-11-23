@@ -31,7 +31,7 @@ directory**. Human docs: `README.md`.
 - **Idempotent**: a second run of `prep`, `enable`, `nodes`, `finalize` reports `changed=0` (probe and check Pods are
   `changed_when: false`).
 - **Published-safe**: no environment values in tracked files. `clusters/*` (except its README), `.state/` and `.sync.env` are
-  gitignored; `cluster.example.yaml` uses RFC 5737 addresses and example.com.
+  gitignored; `cluster.example.yaml` uses documentation addresses (RFC 5737, and 198.18.0.0/15 for the iSCSI side) and example.com.
 - **Versions**: stay on the GA PX-CSI the cluster runs (>= 26.3.0, multi-SAN). NVMe multi-interface needs >= 26.4.0 (only
   `26.4.0-ea1` exists): out of scope. Pins in `docker/` are exact.
 
@@ -135,6 +135,7 @@ roles/nvme_demo             demo StatefulSets: deploy, verify, bounce, teardown
 plugins/filter/             nvme_migration.py (model and helpers), nvme_k8s.py (object readers, NMState)
 tests/model_test.py         offline tests
 tools/sync.sh               optional copy to a jump box
+.claude/skills/             the maintainers' procedures (see "Skills" below)
 .state/                     gitignored: kubeconfig, fa-token, per-cluster snapshots (.state/<name>/), logs
 ```
 
@@ -142,3 +143,16 @@ tools/sync.sh               optional copy to a jump box
 - `python3 tests/model_test.py` (route A: `docker compose run --rm -T toolbox python3 tests/model_test.py`)
 - `ansible-playbook <each playbook> --syntax-check -e cluster=<name>`
 - `--check` of every phase against the live cluster; for a phase change run it twice, the second must be `changed=0`.
+
+## Skills (`.claude/skills/`, for whoever maintains the project; none is needed to use the tool)
+| Skill | Use it for |
+| --- | --- |
+| `verify-change` | The checks above, in full, and what to look at so the words stay true. Last step of every change. |
+| `run-phase` | Running a phase on a live cluster: the plan, the user's go-ahead, `confirm`, a terminal, the proof afterwards. |
+| `diagnose-run` | A failed or interrupted run: read-only look, symptom table, and where to record a new finding. |
+| `change-model` | A new or changed config field: where the value should live, and the touch list. |
+| `change-roles` | Editing roles, playbooks or filters: the hard rules, check mode, the measured traps, the hostnqn unit. |
+| `update-versions` | Dependency pins, a new PX-CSI, OpenShift or Purity release, and the "Tested with" claim. |
+| `publish` | Scan, commit and push to the public repository, and keep the disclaimer and trademark text intact. |
+
+A skill carries no site value (no cluster, host or array name, no address): they are published with the repository.
